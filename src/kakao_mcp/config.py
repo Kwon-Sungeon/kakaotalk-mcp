@@ -75,3 +75,9 @@ DEFAULT_IMAGE_OUTPUT_DIR = os.path.join(
     os.environ.get("USERPROFILE", ""),
     "Documents", "KakaoMCP_Images"
 )
+
+# --- Participant / drawer / profile (added) ---
+DRAWER_BUTTON_OFFSET_X = 25   # px from right edge of chat window to ≡ button
+DRAWER_BUTTON_OFFSET_Y = 30   # px from top edge of chat window to ≡ button
+DRAWER_OPEN_WAIT_SEC = 0.6    # wait after clicking drawer toggle
+PROFILE_OPEN_WAIT_SEC = 0.8   # wait after double-clicking a member

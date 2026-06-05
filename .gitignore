@@ -1,9 +1,6 @@
 __pycache__/
-*.py[cod]
-*.egg-info/
-dist/
-build/
+*.pyc
 .venv/
-.pytest_cache/
-.claude/
-test_images/
+debug/
+debug_capture.png
+src/kakao_mcp/assets/*.png

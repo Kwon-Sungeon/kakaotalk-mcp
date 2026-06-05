@@ -7,7 +7,7 @@ name = "kakaotalk-mcp"
 version = "0.2.0"
 description = "MCP Server for KakaoTalk PC automation via Win32 API"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 license = {text = "MIT"}
 authors = [{name = "kronenz"}]
 keywords = ["mcp", "kakaotalk", "automation", "win32", "claude"]
@@ -20,6 +20,11 @@ classifiers = [
 dependencies = [
     "mcp[cli]>=1.3.0",
     "pywin32>=306",
+    "uiautomation>=2.0.18",
+    "pillow>=10.0",
+    "numpy>=1.26",
+    "opencv-python>=4.9",
+    "winsdk>=1.0.0b10",
 ]
 
 [project.urls]

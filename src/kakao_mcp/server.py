@@ -318,3 +318,348 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ---------------------------------------------------------------------------
+# Participant tools (added)
+# ---------------------------------------------------------------------------
+from kakao_mcp import participants as _participants
+
+
+@app.tool()
+def kakao_list_participants(room_name: str) -> Dict:
+    """List participants of a group chat room by opening its side drawer (≡).
+    NOTE: Briefly brings the chat window to foreground and opens the drawer.
+
+    Args:
+        room_name: Exact title of the group chat window (must be open).
+    """
+    try:
+        return _participants.list_participants(room_name)
+    except Exception as e:
+        return {"error": f"Failed to list participants: {e}"}
+
+
+@app.tool()
+def kakao_dm_member(
+    room_name: str,
+    member_name: str,
+    message: str,
+    add_friend: bool = True,
+    close_after: bool = False,
+) -> Dict:
+    """Send a 1:1 direct message to a member of a group chat.
+    Tries friend-search first; falls back to opening the member's profile
+    from the group chat drawer, optionally clicking '친구 추가', then '1:1 채팅'.
+
+    Args:
+        room_name: Group chat window title the member belongs to.
+        member_name: Display name of the member.
+        message: Text to send.
+        add_friend: Click '친구 추가' in profile popup if present (default True).
+        close_after: Close the 1:1 window after sending (default False).
+    """
+    try:
+        if not message.strip():
+            return {"error": "Message cannot be empty"}
+        return _participants.dm_member(room_name, member_name, message,
+                                       add_friend, close_after)
+    except Exception as e:
+        return {"error": f"Failed to DM member: {e}"}
+
+
+@app.tool()
+def kakao_open_member_profile(room_name: str, member_name: str) -> Dict:
+    """Open a member's profile popup from the group chat drawer (debug/manual step).
+
+    Args:
+        room_name: Group chat window title.
+        member_name: Display name of the member.
+    """
+    try:
+        return _participants.open_member_profile(room_name, member_name)
+    except Exception as e:
+        return {"error": f"Failed to open profile: {e}"}
+
+
+@app.tool()
+def kakao_inspect_ui(room_name: str = "", max_depth: int = 6) -> Dict:
+    """Dump the Win32 + UIA control tree of a chat window (or all KakaoTalk
+    windows if room_name is empty). Use to calibrate button names and offsets
+    for participant tools.
+
+    Args:
+        room_name: Chat window title, or empty for all top-level EVA windows.
+        max_depth: Tree depth limit (default 6).
+    """
+    try:
+        return _participants.dump_ui_tree(room_name, max_depth)
+    except Exception as e:
+        return {"error": f"Failed to inspect UI: {e}"}
+
+
+@app.tool()
+def kakao_close_popups() -> Dict:
+    """Press ESC to close any open popup/drawer (cleanup helper)."""
+    try:
+        _participants.close_popups()
+        return {"message": "Sent ESC to close popups"}
+    except Exception as e:
+        return {"error": f"Failed: {e}"}
+
+
+# ---------------------------------------------------------------------------
+# Vision (template-matching) tools (added)
+# ---------------------------------------------------------------------------
+from kakao_mcp import vision as _vision
+
+
+@app.tool()
+def kakao_capture_window(room_name: str, save_path: str = "") -> Dict:
+    """Capture a chat window screenshot to a PNG file (for template creation).
+    Coordinates inside the saved image are window-relative pixels.
+
+    Args:
+        room_name: Exact title of the chat window.
+        save_path: Where to save the PNG (default: project debug_capture.png).
+    """
+    try:
+        return _vision.capture_window_to_file(room_name, save_path)
+    except Exception as e:
+        return {"error": f"Capture failed: {e}"}
+
+
+@app.tool()
+def kakao_save_template(room_name: str, left: int, top: int,
+                        right: int, bottom: int, template_name: str) -> Dict:
+    """Crop a region from the live chat window and save it as a click template.
+    Use kakao_capture_window first to determine the region coordinates.
+
+    Args:
+        room_name: Exact title of the chat window.
+        left/top/right/bottom: Region in window-relative pixels.
+        template_name: Template name (e.g. 'member_icon').
+    """
+    try:
+        return _vision.save_template(room_name, left, top, right, bottom,
+                                     template_name)
+    except Exception as e:
+        return {"error": f"Save template failed: {e}"}
+
+
+@app.tool()
+def kakao_click_template(room_name: str, template_name: str,
+                         threshold: float = 0.75,
+                         double_click: bool = False,
+                         offset_x: int = 0, offset_y: int = 0) -> Dict:
+    """Find a saved template image inside the chat window and click it.
+    Multi-scale matching; robust to small UI/DPI changes.
+
+    Args:
+        room_name: Exact title of the chat window.
+        template_name: Name of a template saved via kakao_save_template.
+        threshold: Min match score 0~1 (default 0.75).
+        double_click: Double-click instead of single click.
+        offset_x/offset_y: Pixel offset from match center.
+    """
+    try:
+        return _vision.click_template(room_name, template_name, threshold,
+                                      double_click, offset_x, offset_y)
+    except Exception as e:
+        return {"error": f"Click template failed: {e}"}
+
+
+@app.tool()
+def kakao_open_member_list(room_name: str, threshold: float = 0.7) -> Dict:
+    """Open the participant list popup by clicking the person-count icon
+    (👤N) under the chat room title, located via the 'member_icon' template.
+    Returns any new popup window that appeared.
+
+    Args:
+        room_name: Exact title of the group chat window.
+        threshold: Min match score (default 0.7).
+    """
+    try:
+        return _vision.open_member_list(room_name, threshold)
+    except Exception as e:
+        return {"error": f"Open member list failed: {e}"}
+
+
+@app.tool()
+def kakao_list_templates() -> Dict:
+    """List saved click templates."""
+    try:
+        return {"templates": _vision.list_templates()}
+    except Exception as e:
+        return {"error": f"{e}"}
+
+
+@app.tool()
+def kakao_capture_hwnd(hwnd: int, save_path: str) -> Dict:
+    """Capture ANY window by hwnd to a PNG file (e.g. member list popup,
+    profile popup). Use the hwnd returned by kakao_open_member_list.
+
+    Args:
+        hwnd: Window handle.
+        save_path: Where to save the PNG.
+    """
+    try:
+        return _vision.capture_hwnd_to_file(hwnd, save_path)
+    except Exception as e:
+        return {"error": f"Capture failed: {e}"}
+
+
+@app.tool()
+def kakao_click_at(hwnd: int, x: int, y: int,
+                   double_click: bool = False) -> Dict:
+    """Click at window-relative pixel coordinates of a window (by hwnd).
+    Use with kakao_capture_hwnd: read the image, pick the target pixel,
+    then click it (e.g. double-click a member row in the list popup).
+
+    Args:
+        hwnd: Window handle.
+        x, y: Window-relative pixel coordinates.
+        double_click: Double-click instead of single (default False).
+    """
+    try:
+        return _vision.click_at(hwnd, x, y, double_click)
+    except Exception as e:
+        return {"error": f"Click failed: {e}"}
+
+
+# ---------------------------------------------------------------------------
+# OCR tools (Windows built-in OCR, added)
+# ---------------------------------------------------------------------------
+from kakao_mcp import ocr as _ocr
+
+
+@app.tool()
+def kakao_ocr_window(room_name: str = "", hwnd: int = 0,
+                     lang: str = "ko") -> Dict:
+    """Read all text from a window using Windows built-in OCR.
+    Returns lines with window-relative bounding rects and centers.
+    Pass either room_name (chat window title) or hwnd (e.g. a popup).
+
+    Args:
+        room_name: Chat window title (used if hwnd is 0).
+        hwnd: Window handle (takes priority over room_name).
+        lang: OCR language (default 'ko').
+    """
+    try:
+        if hwnd:
+            return _ocr.ocr_hwnd(hwnd, lang=lang)
+        if room_name:
+            return _ocr.ocr_room(room_name, lang=lang)
+        return {"error": "Provide room_name or hwnd"}
+    except Exception as e:
+        return {"error": f"OCR failed: {e}"}
+
+
+@app.tool()
+def kakao_click_text(text: str, room_name: str = "", hwnd: int = 0,
+                     double_click: bool = False, lang: str = "ko") -> Dict:
+    """Find text in a window via OCR and click its center.
+    Partial and whitespace-insensitive matching. Use for clicking a member
+    name in the participant popup or buttons like '1:1 채팅' in profiles.
+
+    Args:
+        text: Text to find (e.g. member name, '1:1 채팅').
+        room_name: Chat window title (used if hwnd is 0).
+        hwnd: Window handle (takes priority).
+        double_click: Double-click instead of single click.
+        lang: OCR language (default 'ko').
+    """
+    try:
+        if not hwnd:
+            if not room_name:
+                return {"error": "Provide room_name or hwnd"}
+            h = None
+            from kakao_mcp.controller import find_chat_window
+            h = find_chat_window(room_name)
+            if h is None:
+                return {"error": f"Chat window '{room_name}' not found"}
+            hwnd = h
+        return _ocr.click_text(hwnd, text, double_click)
+    except Exception as e:
+        return {"error": f"Click text failed: {e}"}
+
+
+# ---------------------------------------------------------------------------
+# Group DM (fully server-side member iteration, added)
+# ---------------------------------------------------------------------------
+from kakao_mcp import group_dm as _group_dm
+
+
+@app.tool()
+def kakao_open_member_popup(room_name: str) -> Dict:
+    """Open the member-list popup of a group chat and return its window handle
+    (server-side; clicks the person-count icon via Win32).
+
+    Args:
+        room_name: Exact title of the group chat window.
+    """
+    try:
+        return _group_dm.open_member_popup(room_name)
+    except Exception as e:
+        return {"error": f"Open member popup failed: {e}"}
+
+
+@app.tool()
+def kakao_dm_all_members(room_name: str, message: str,
+                         close_after: bool = True,
+                         interval_sec: float = 4.0,
+                         max_members: int = 50,
+                         skip_names: list[str] = None) -> Dict:
+    """Send a 1:1 message to EVERY member of a group chat, fully server-side
+    (no computer-use). Opens the member popup, OCRs it, double-clicks each
+    member to open their 1:1 chat, sends the message, and closes the window.
+
+    Args:
+        room_name: Group chat window title (must be open).
+        message: Text to send to each member.
+        close_after: Close each 1:1 window after sending (default True).
+        interval_sec: Seconds between members (min 3, default 4).
+        max_members: Safety cap on how many to send (default 50).
+        skip_names: OCR names to skip (e.g. already-sent members).
+    """
+    try:
+        if not message.strip():
+            return {"error": "Message cannot be empty"}
+        return _group_dm.dm_all_members(room_name, message, close_after,
+                                        interval_sec, max_members, skip_names)
+    except Exception as e:
+        return {"error": f"DM all members failed: {e}"}
+
+
+@app.tool()
+def kakao_dm_all_members_kbd(room_name: str, message: str,
+                             member_count: int = 0,
+                             start_index: int = 0,
+                             close_after: bool = True,
+                             interval_sec: float = 3.0,
+                             max_send: int = 50,
+                             skip_titles: list[str] = None) -> Dict:
+    """Send a 1:1 message to every member of a group chat using ARROW-KEY
+    navigation (no click coordinates — avoids mis-clicking '멤버 초대하기').
+    For member index i: opens the popup, focuses the list, presses Home then
+    Down i times to highlight the i-th member, Enter to open the 1:1 chat,
+    sends, and closes. Index-based, so the trailing invite row is never hit.
+
+    Args:
+        room_name: Group chat window title (must be open).
+        message: Text to send to each member.
+        member_count: Number of members (0 = auto-read from header).
+        start_index: Member index to start from (for resuming in batches).
+        close_after: Close each 1:1 window after sending (default True).
+        interval_sec: Seconds between members (min 3, default 3).
+        max_send: Cap on how many sends in this call (default 50).
+        skip_titles: Exact 1:1 window titles to skip (already-sent members).
+    """
+    try:
+        if not message.strip():
+            return {"error": "Message cannot be empty"}
+        return _group_dm.dm_all_members_kbd(
+            room_name, message, member_count, start_index,
+            close_after, interval_sec, max_send, skip_titles)
+    except Exception as e:
+        return {"error": f"DM all (kbd) failed: {e}"}
