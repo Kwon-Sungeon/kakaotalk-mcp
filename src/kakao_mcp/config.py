@@ -70,6 +70,16 @@ MENTION_SELECT_WAIT_SEC = 0.3  # Was 0.5 — after Enter to select
 MENTION_PASTE_WAIT_SEC = 0.2  # Was 0.3 — after Ctrl+V
 MENTION_SEND_WAIT_SEC = 0.3  # Was 0.5 — after final Enter
 
+KAKAO_INPUT_PLACEHOLDERS = frozenset(
+    ["메시지 입력"]
+    + [part.strip() for part in os.environ.get("KAKAO_MCP_INPUT_PLACEHOLDERS", "").split(";") if part.strip()]
+)
+
+# Monitor
+MONITOR_MAX_EVENTS = 100
+MONITOR_MAX_WAIT_SEC = 45.0  # Upper bound for a blocking event wait (hosts time out near 60 s)
+MONITOR_MATCH_ALL = "*"  # Keyword which matches every new message
+
 # Default output directory for downloaded images
 DEFAULT_IMAGE_OUTPUT_DIR = os.path.join(
     os.environ.get("USERPROFILE", ""),

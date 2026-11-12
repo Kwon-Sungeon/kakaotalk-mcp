@@ -3,9 +3,11 @@ import os
 import sys
 import time
 import ctypes
+from datetime import datetime
 import re
 from contextlib import contextmanager
 from ctypes import wintypes
+import filecmp
 import shutil
 import subprocess
 import threading
@@ -75,7 +77,7 @@ def find_chat_window(room_name: str) -> Optional[int]:
             cls = win32gui.GetClassName(hwnd)
             title = win32gui.GetWindowText(hwnd)
             if (hwnd != main and cls == config.KAKAO_CHAT_WINDOW_CLASS and title == room_name
-                    and win32process.GetWindowThreadProcessId(hwnd)[1] == pid):
+                    and win32process.GetWindowThreadProcessId(hwnd)[1] == pid and _is_chat_window(hwnd)):
                 results.append(hwnd)
         return True
 
@@ -106,6 +108,7 @@ def list_chat_windows() -> List[Dict]:
                 and hwnd != main_hwnd
                 and title
                 and title != config.KAKAO_MAIN_WINDOW_TITLE
+                and _is_chat_window(hwnd)
             ):
                 windows.append({"hwnd": hwnd, "title": title})
         return True
@@ -133,6 +136,17 @@ def find_child_window_recursive(parent_hwnd: int, class_name: str) -> Optional[i
     except Exception:
         pass
     return found[0] if found else None
+
+
+def _is_chat_window(hwnd: int) -> bool:
+    """A chat room holds both the message input and the message list.
+
+    Board (Moim), profile and viewer windows use the same window class and
+    can carry a person's name as their title, so the class and title alone
+    would list them as open rooms.
+    """
+    return (find_child_window_recursive(hwnd, config.KAKAO_EDIT_CLASS) is not None
+            and find_child_window_recursive(hwnd, config.KAKAO_LIST_CONTROL_CLASS) is not None)
 
 
 @operation()
@@ -234,7 +248,7 @@ def _click_control(window, control):
     _require_focus(window, control)
 
 
-def _native_send_button(window, *, custom=False):
+def _native_send_button(window, *, custom=False, include_disabled=False):
     """A standard, enabled send button can receive BM_CLICK without global input."""
     if not win32gui.IsWindowEnabled(window):
         return None
@@ -246,7 +260,7 @@ def _native_send_button(window, *, custom=False):
                 and win32gui.GetAncestor(control, win32con.GA_ROOT) == window
                 and re.fullmatch(r'(전송|보내기|send)(?:\s*\([a-z]\))?',
                                  win32gui.GetWindowText(control).replace('&', '').strip(), re.I)
-                and win32gui.IsWindowVisible(control) and win32gui.IsWindowEnabled(control)):
+                and win32gui.IsWindowVisible(control) and (include_disabled or win32gui.IsWindowEnabled(control))):
             buttons.append(control)
         return True
 
@@ -369,12 +383,58 @@ def _read_clipboard_text(max_retries: int = None, interval_sec: float = None) ->
 # Message sending
 # ---------------------------------------------------------------------------
 
+def _empty_input(edit, shown=None):
+    shown = _edit_text(edit) if shown is None else shown
+    if not shown:
+        return True
+    if shown not in config.KAKAO_INPUT_PLACEHOLDERS:
+        return False
+    # A cue can be returned by WM_GETTEXT even when the underlying Rich Edit
+    # contains zero characters. Protect a real draft whose text equals the cue.
+    _, length = win32gui.SendMessageTimeout(edit, win32con.EM_LINELENGTH, 0, 0,
+                                            win32con.SMTO_ABORTIFHUNG, 1000)
+    return length == 0
+
+
+def _matches_draft(edit, expected):
+    shown = _edit_text(edit)
+    return shown == expected and not _empty_input(edit, shown)
+
+
+def _paste_into_focused_input(hwnd, edit, room_name, expected, target):
+    bring_window_to_front(hwnd)
+    _focus_control(hwnd, edit)
+    if target:
+        target.verify()
+    if find_chat_window(room_name) != hwnd or not _empty_input(edit):
+        return False
+    _require_focus(hwnd, edit)
+    snapshot = _plain_clipboard_snapshot()
+    clip = win32clipboard
+    clip.OpenClipboard()
+    try:
+        before = clip.GetClipboardSequenceNumber()
+        clip.EmptyClipboard()
+        clip.SetClipboardText(expected.replace('\n', '\r\n'), win32con.CF_UNICODETEXT)
+        after = clip.GetClipboardSequenceNumber()
+    finally:
+        clip.CloseClipboard()
+    try:
+        if not _empty_input(edit) or clip.GetClipboardSequenceNumber() != after:
+            return False
+        _require_focus(hwnd, edit)
+        _send_ctrl_key_combo(0x56)
+        return bool(_wait_until(lambda: _matches_draft(edit, expected), 1.5))
+    finally:
+        _restore_plain_clipboard(snapshot, before, after)
+
+
 @operation()
 def send_message_to_room(room_name: str, text: str, *, target=None) -> Dict:
     """Send a text message to a KakaoTalk chat room.
 
-    Fill the native edit control directly, then focus it to send Enter.
-    NOTE: This briefly brings the chat window to the foreground.
+    Use the native send button when identifiable. Buttonless clients need a
+    focused paste and an Enter message addressed to the verified edit control.
 
     Returns:
         Dict with success (bool) and message or error.
@@ -389,12 +449,23 @@ def send_message_to_room(room_name: str, text: str, *, target=None) -> Dict:
     if edit_hwnd is None:
         return {"success": False, "status": "failed_before_send", "code": "input_not_found", "error": f"Edit control not found in '{room_name}'"}
 
-    if _edit_text(edit_hwnd):
+    shown = _edit_text(edit_hwnd)
+    if shown and shown not in config.KAKAO_INPUT_PLACEHOLDERS:
         return {"success": False, "status": "failed_before_send", "code": "draft_exists", "error": "Chat has an existing draft"}
-
     if not win32gui.IsWindowEnabled(hwnd):
         return {"success": False, "status": "failed_before_send", "code": "room_busy", "error": "Room has an open dialog"}
     expected = text.replace('\r\n', '\n').replace('\r', '\n')
+    button = _native_send_button(hwnd, include_disabled=True) or _native_send_button(hwnd, custom=True, include_disabled=True)
+    if not button:
+        try:
+            ready = _paste_into_focused_input(hwnd, edit_hwnd, room_name, expected, target)
+        except Exception as error:
+            return {"success": False, "status": "failed_before_send", "code": "input_not_ready", "error": str(error)}
+        if not ready:
+            return {"success": False, "status": "failed_before_send", "code": "draft_changed", "error": "Paste target or draft not verified"}
+        return _submit_draft(room_name, hwnd, edit_hwnd, expected, target)
+    if not _empty_input(edit_hwnd, shown):
+        return {"success": False, "status": "failed_before_send", "code": "draft_exists", "error": "Chat has an existing draft"}
     # EM_REPLACESEL goes to this Rich Edit and updates its change listeners.
     _replace_selection(edit_hwnd, expected.replace('\n', '\r\n'))
     draft = _edit_text(edit_hwnd)
@@ -415,7 +486,7 @@ def _submit_draft(room_name, hwnd, edit_hwnd, expected, target=None):
         target.verify()
     button = _native_send_button(hwnd)
     if button:
-        if find_chat_window(room_name) != hwnd or _edit_text(edit_hwnd) != expected:
+        if find_chat_window(room_name) != hwnd or not _matches_draft(edit_hwnd, expected):
             return {"success": False, "status": "failed_before_send", "code": "draft_changed", "error": "Chat draft changed before send"}
         win32gui.SendMessageTimeout(button, win32con.BM_CLICK, 0, 0, win32con.SMTO_ABORTIFHUNG, 1000)
         return _sent_when_cleared(edit_hwnd, room_name)
@@ -426,7 +497,7 @@ def _submit_draft(room_name, hwnd, edit_hwnd, expected, target=None):
         # messages to this button HWND only; never move the desktop pointer.
         _, _, width, height = win32gui.GetClientRect(custom_button)
         if (not width or not height or find_chat_window(room_name) != hwnd
-                or _edit_text(edit_hwnd) != expected):
+                or not _matches_draft(edit_hwnd, expected)):
             return {"success": False, "error": "Target or draft changed before send"}
         point = ((height // 2) << 16) | (width // 2)
         for msg, keys in [(win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON), (win32con.WM_LBUTTONUP, 0)]:
@@ -435,7 +506,7 @@ def _submit_draft(room_name, hwnd, edit_hwnd, expected, target=None):
 
     bring_window_to_front(hwnd)
     _focus_control(hwnd, edit_hwnd)
-    if _edit_text(edit_hwnd) != expected:
+    if not _matches_draft(edit_hwnd, expected):
         return {"success": False, "status": "failed_before_send", "code": "draft_changed", "error": "Chat draft changed before send"}
     if find_chat_window(room_name) != hwnd:
         return {"success": False, "error": "Target room changed before send"}
@@ -455,7 +526,7 @@ def _submit_draft(room_name, hwnd, edit_hwnd, expected, target=None):
 
 
 def _sent_when_cleared(edit, room):
-    if _wait_until(lambda: _edit_text(edit) == '', 2):
+    if _wait_until(lambda: _empty_input(edit), 2):
         return {"success": True, "confirmation": "draft_cleared", "message": f"Message sent to '{room}'"}
     return {"success": False, "error": "Send not confirmed: the draft did not clear. Check the room; "
             "do not retry automatically. If KakaoTalk uses Ctrl+Enter set KAKAO_LEGACY_SEND_KEY=ctrl_enter."}
@@ -575,7 +646,7 @@ def send_image_to_room(room_name: str, image_path: str, *, target=None) -> Dict:
     if edit_hwnd is None:
         return {"success": False, "status": "failed_before_send", "code": "input_not_found", "error": f"Edit control not found in '{room_name}'"}
 
-    if _edit_text(edit_hwnd):
+    if not _empty_input(edit_hwnd):
         return {"success": False, "status": "failed_before_send", "code": "draft_exists", "error": "Chat has an existing draft"}
     try:
         with temporary_image_clipboard(abs_path) as sequence:
@@ -592,7 +663,7 @@ def _send_prepared_image(hwnd, edit_hwnd, sequence, room_name, abs_path):
     bring_window_to_front(hwnd)
     _focus_control(hwnd, edit_hwnd)
     _require_focus(hwnd, edit_hwnd)
-    if win32clipboard.GetClipboardSequenceNumber() != sequence or _edit_text(edit_hwnd):
+    if win32clipboard.GetClipboardSequenceNumber() != sequence or not _empty_input(edit_hwnd):
         return {"success": False, "status": "failed_before_send", "error": "Clipboard or draft changed"}
     win32gui.PostMessage(edit_hwnd, win32con.WM_PASTE, 0, 0)
     result = bridge.request(dict(action='legacy_image_confirm', room=room_name, hwnd=hwnd,
@@ -850,7 +921,7 @@ def _find_visible_search_list(view: int) -> Optional[int]:
 # ---------------------------------------------------------------------------
 
 def get_kakao_user_hash_dir() -> Optional[str]:
-    """Find the first user hash directory under KakaoTalk users dir.
+    """Resolve the selected or only account cache under the KakaoTalk users directory.
 
     KakaoTalk stores per-user data in a directory named with a SHA1 hash.
     Returns the full path or None.
@@ -858,10 +929,37 @@ def get_kakao_user_hash_dir() -> Optional[str]:
     users_dir = config.KAKAO_USERS_DIR
     if not os.path.isdir(users_dir):
         return None
-    for entry in os.listdir(users_dir):
-        full = os.path.join(users_dir, entry)
-        if os.path.isdir(full) and len(entry) == 40:
-            return full
+    accounts = [entry for entry in os.listdir(users_dir) if re.fullmatch(r'[0-9a-fA-F]{40}', entry)
+                and os.path.isdir(os.path.join(users_dir, entry))]
+    selected = os.environ.get('KAKAO_MCP_CACHE_ACCOUNT')
+    if selected:
+        if selected not in accounts:
+            raise ValueError('Configured cache account not found')
+        return os.path.join(users_dir, selected)
+    if len(accounts) > 1:
+        raise ValueError('Multiple account caches; select one with KAKAO_MCP_CACHE_ACCOUNT')
+    return os.path.join(users_dir, accounts[0]) if accounts else None
+
+
+def _sniff_image_extension(path: str) -> Optional[str]:
+    """Return the extension matching the file's signature, or None if it is not an image."""
+    try:
+        with open(path, 'rb') as stream:
+            head = stream.read(16)
+    except OSError:
+        return None
+    if head.startswith(b'\xff\xd8\xff'):
+        return '.jpg'
+    if head.startswith(b'\x89PNG\r\n\x1a\n'):
+        return '.png'
+    if head[:6] in (b'GIF87a', b'GIF89a'):
+        return '.gif'
+    if head[:4] == b'RIFF' and head[8:12] == b'WEBP':
+        return '.webp'
+    if head[4:8] == b'ftyp' and head[8:12] in (b'heic', b'heix', b'hevc', b'mif1', b'msf1'):
+        return '.heic'
+    if head[:2] == b'BM':
+        return '.bmp'
     return None
 
 
@@ -883,9 +981,11 @@ def download_recent_images(
     Returns:
         Dict with message, images list, or error.
     """
+    if max_images < 1:
+        return {"success": False, "error": "max_images must be positive", "images": []}
     user_dir = get_kakao_user_hash_dir()
     if user_dir is None:
-        return {"error": "KakaoTalk user data directory not found"}
+        return {"success": False, "error": "KakaoTalk user data directory not found", "images": []}
 
     # Collect all image files from cache directories
     image_files: List[Dict] = []
@@ -911,37 +1011,64 @@ def download_recent_images(
             except OSError:
                 continue
 
+    # The cache belongs to the whole account, not to one room.
+    scope = {"success": True, "scope": "account_cache", "partial": True}
     if not image_files:
         return {
-            "message": f"No cached images found for room '{room_name}'",
+            **scope,
+            "message": "No cached account images found",
             "images": [],
         }
 
     # Sort by modification time (newest first)
     image_files.sort(key=lambda x: x["mtime"], reverse=True)
-    image_files = image_files[:max_images]
 
-    # Copy to output directory
+    # Copy to output directory. Cache files have no reliable extension, so the
+    # real format is read from the file signature and other files are skipped.
     os.makedirs(output_dir, exist_ok=True)
     copied: List[Dict] = []
+    skipped = 0
     for img in image_files:
-        dest_name = img["name"]
-        if not os.path.splitext(dest_name)[1]:
-            dest_name += ".jpg"
-        dest = os.path.join(output_dir, dest_name)
+        if len(copied) >= max_images:
+            break
+        extension = _sniff_image_extension(img["path"])
+        if extension is None:
+            skipped += 1
+            continue
+        stem = os.path.splitext(img["name"])[0]
+        dest = os.path.join(output_dir, stem + extension)
         try:
-            shutil.copy2(img["path"], dest)
+            suffix = 1
+            while True:
+                try:
+                    output = open(dest, "xb")
+                except FileExistsError:
+                    if os.path.isfile(dest) and filecmp.cmp(img["path"], dest, shallow=False):
+                        break
+                    suffix += 1
+                    dest = os.path.join(output_dir, f"{stem}-{suffix}{extension}")
+                    continue
+                try:
+                    with output, open(img["path"], "rb") as source:
+                        shutil.copyfileobj(source, output)
+                except OSError:
+                    os.unlink(dest)
+                    raise
+                break
             copied.append({
                 "source": img["path"],
                 "destination": dest,
                 "size": img["size"],
+                "modified": datetime.fromtimestamp(img["mtime"]).isoformat(timespec="seconds"),
             })
         except OSError:
             continue
 
     return {
+        **scope,
         "message": f"Downloaded {len(copied)} image(s) to {output_dir}",
         "images": copied,
+        "skipped_non_images": skipped,
     }
 
 
@@ -1045,11 +1172,13 @@ def send_mention_message(room_name: str, mention_name: str, message: str, *, tar
     edit = find_child_window_recursive(hwnd, config.KAKAO_EDIT_CLASS) if hwnd else None
     if not edit:
         return {"success": False, "status": "failed_before_send", "error": "Target chat input not found"}
-    if _edit_text(edit):
+    if not _empty_input(edit):
         return {"success": False, "status": "failed_before_send", "code": "draft_exists", "error": "Chat has an existing draft"}
     bring_window_to_front(hwnd)
     _focus_control(hwnd, edit)
     _require_focus(hwnd, edit)
+    if not _empty_input(edit):
+        return {"success": False, "status": "failed_before_send", "code": "draft_exists", "error": "Chat has an existing draft"}
     _press_key(0x32, shift=True)
     time.sleep(config.MENTION_AT_WAIT_SEC)
     for vk, shift in _decompose_korean(mention_name):
@@ -1079,8 +1208,13 @@ class ChatMonitor:
     def __init__(self):
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self._events: deque = deque(maxlen=100)
+        self._events: deque = deque(maxlen=config.MONITOR_MAX_EVENTS)
         self._events_lock = threading.Lock()
+        self._events_ready = threading.Condition(self._events_lock)
+        self._dropped = 0
+        self._polls = 0
+        self._last_poll: Optional[str] = None
+        self._last_error: Optional[str] = None
         self._seen_counts = Counter()
         self._room_name: str = ""
         self._keywords: List[str] = []
@@ -1100,11 +1234,17 @@ class ChatMonitor:
 
         self._room_name = room_name
         self._read_mode = read_mode
-        self._keywords = [kw.lower() for kw in keywords]
+        self._keywords = [kw.strip().lower() for kw in keywords if kw and kw.strip()]
+        if not self._keywords:
+            return {"success": False, "error": "Keywords list cannot be empty"}
         self._poll_interval = max(3.0, poll_interval)
         self._stop_event.clear()
         with self._events_lock:
             self._events.clear()
+            self._dropped = 0
+        self._polls = 0
+        self._last_poll = None
+        self._last_error = None
         self.baseline_ready = False
         self._seen_counts.clear()
         self._running = True
@@ -1134,14 +1274,50 @@ class ChatMonitor:
         if self._thread.is_alive():
             return {"success": False, "error": "Monitor is finishing its current UI operation"}
         self._running = False
+        with self._events_ready:
+            self._events_ready.notify_all()
         return {"success": True, "message": "Monitor stopped"}
 
-    def get_events(self) -> List[Dict]:
-        """Return and clear all pending keyword-match events."""
-        with self._events_lock:
+    def get_events(self, wait_sec: float = 0) -> List[Dict]:
+        """Return and clear all pending keyword-match events.
+
+        With wait_sec, block until an event arrives, the monitor stops or the
+        time is up. One waiting call replaces many empty polls by the client.
+        """
+        wait = min(max(0.0, float(wait_sec or 0)), config.MONITOR_MAX_WAIT_SEC)
+        deadline = time.monotonic() + wait
+        with self._events_ready:
+            while not self._events and self.is_running:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._events_ready.wait(min(remaining, 1.0))
             events = list(self._events)
             self._events.clear()
         return events
+
+    def status(self) -> Dict:
+        """What the monitor is watching and how the last poll went."""
+        running = self.is_running
+        return {
+            "monitoring": running,
+            "room_name": self._room_name or None,
+            "keywords": list(self._keywords),
+            "poll_interval_sec": self._poll_interval,
+            "read_mode": self._read_mode,
+            "baseline_ready": running and self.baseline_ready,
+            "polls": self._polls,
+            "last_poll": self._last_poll,
+            "last_error": self._last_error,
+            "dropped_events": self._dropped,
+        }
+
+    def _emit(self, event: Dict):
+        with self._events_ready:
+            if len(self._events) == self._events.maxlen:
+                self._dropped += 1  # The oldest event is about to be pushed out.
+            self._events.append(event)
+            self._events_ready.notify_all()
 
     def _message_key(self, msg):
         return tuple(msg.get(field) for field in ('date', 'sender', 'time', 'text'))
@@ -1168,6 +1344,7 @@ class ChatMonitor:
             try:
                 self._check_for_new_messages()
             except Exception as e:
+                self._last_error = str(e)
                 _log(f"Monitor poll error: {e}")
         _log("Monitor stopped")
 
@@ -1175,8 +1352,14 @@ class ChatMonitor:
         """Poll for new messages and check for keyword matches."""
         from . import backend
         result = backend.read_chat_messages(self._room_name, self._read_mode, monitoring=True)
+        self._polls += 1
+        self._last_poll = datetime.now().astimezone().isoformat(timespec="seconds")
         if not result["success"]:
+            # A closed room or a failed read used to pass without a trace.
+            if not result.get("deferred"):
+                self._last_error = result.get("error") or "Read failed"
             return
+        self._last_error = None
 
         from . import parser
         parsed = result.get('parsed') or parser.parse_chat_text(result["raw_text"])
@@ -1202,7 +1385,7 @@ class ChatMonitor:
         for msg in new_messages:
             text_lower = msg.get("text", "").lower()
             for kw in self._keywords:
-                if kw in text_lower:
+                if kw == config.MONITOR_MATCH_ALL or kw in text_lower:
                     context_start = max(0, len(all_messages) - 10)
                     event = {
                         "keyword": kw,
@@ -1212,8 +1395,7 @@ class ChatMonitor:
                         "recent_context": all_messages[context_start:],
                         "room_name": self._room_name,
                     }
-                    with self._events_lock:
-                        self._events.append(event)
+                    self._emit(event)
                     _log(f"Monitor: keyword '{kw}' matched in message from {msg.get('sender')}")
                     break  # One event per message
 

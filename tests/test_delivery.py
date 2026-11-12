@@ -135,3 +135,45 @@ def test_legacy_mention_preserves_draft_and_never_sends_blind_enter(monkeypatch)
     with pytest.raises(RuntimeError, match='no exact'):
         legacy.send_mention_message('fixture', 'Alice', 'test')
     assert all(args.args[0] != 13 for args in key.call_args_list)
+
+
+def test_dry_run_validates_without_opening_room_or_creating_journal(fake, tmp_path):
+    assert d.recent_receipts() == {'records': []}
+    result = server.kakao_send_message('fixture', 'private draft', dry_run=True)
+    assert result['status'] == 'inputs_validated' and not result['room_verified']
+    with pytest.raises(d.DeliveryError, match='files must exist'):
+        server.kakao_send_file('fixture', [str(tmp_path / 'missing')], dry_run=True)
+    fake.assert_not_called()
+    d.resolve.assert_not_called()
+    assert not (tmp_path / 'KakaoTalk-MCP').exists()
+
+
+@pytest.mark.parametrize('setting,value', [('KAKAO_MCP_BLOCKED_ROOMS', 'two'),
+                                          ('KAKAO_MCP_ALLOWED_ROOMS', 'one'),
+                                          ('KAKAO_MCP_MAX_BULK_ROOMS', '1'),
+                                          ('KAKAO_MCP_READ_ONLY', '1')])
+def test_policy_denies_batch_before_first_room(fake, monkeypatch, setting, value):
+    monkeypatch.setenv(setting, value)
+    with pytest.raises(d.DeliveryError) as exc:
+        server.kakao_send_bulk(['one', 'two'], 'test')
+    assert exc.value.code == 'policy_denied'
+    d.resolve.assert_not_called()
+    fake.assert_not_called()
+
+
+def test_file_method_switch_preserves_item_fence_and_filtered_log(fake, tmp_path):
+    file = tmp_path / 'attachment.txt'
+    file.touch()
+    fake.side_effect = RuntimeError('lost confirmation')
+    def send(method, key):
+        return server.kakao_send_file('room', [str(file)], method=method, request_id=key)
+    assert send('clipboard', 'first')['results'][0]['status'] == 'unconfirmed'
+    assert send('picker', 'first')['replayed']
+    assert send('picker', 'second')['code'] == 'previous_send_unconfirmed'
+    fake.assert_called_once()
+    assert fake.call_args.args[1] == 'file_clipboard'
+    assert server.kakao_get_send_log(room_name='other') == {'records': []}
+    rows = server.kakao_get_send_log(room_name='room')['records']
+    first = next(row for row in rows if row['request_id'] == 'first')
+    assert first['status'] == 'unconfirmed'
+    assert set(first) == {'request_id', 'item_index', 'room', 'status', 'updated_unix'}

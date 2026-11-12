@@ -30,6 +30,11 @@ public class KakaoInput {
   return SendMessageTimeoutW(h,0x0D,new IntPtr(value.Capacity),value,2,500,out result)!=IntPtr.Zero && value.ToString()==path;
  }
  [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern bool PostMessageW(IntPtr h,uint m,IntPtr w,IntPtr l);
+ public static bool PasteFile(IntPtr room,IntPtr edit,uint sequence){
+  IntPtr result;
+  return IsChild(room,edit) && FilenameEquals(edit,"") && GetClipboardSequenceNumber()==sequence &&
+         SendMessageTimeoutW(edit,0x302,IntPtr.Zero,IntPtr.Zero,2,1500,out result)!=IntPtr.Zero;
+ }
  public static bool CursorAt(int x,int y){Point p; return GetCursorPos(out p) && p.X == x && p.Y == y;}
  [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
  [DllImport("user32.dll")] private static extern IntPtr GetClipboardOwner();
@@ -252,6 +257,23 @@ function FilePick($w) {
  }else{
   Front $w
   if((OwnedPopup) -or -not (FileRoom).Current.IsEnabled){throw 'Legacy room has an open dialog'}
+  if($request.edit_hwnd){
+   $edit=[IntPtr]$request.edit_hwnd
+   if(-not [KakaoInput]::IsChild([IntPtr]$request.hwnd,$edit)){throw 'Legacy input changed'}
+   $field=[System.Windows.Automation.AutomationElement]::FromHandle($edit)
+   if($field.Current.ClassName -ine 'RICHEDIT50W' -or $field.Current.ProcessId -ne $request.process_id){throw 'Legacy input changed'}
+   $field.SetFocus()
+   Add-Type -AssemblyName System.Windows.Forms
+   $paths=[System.Windows.Forms.Clipboard]::GetFileDropList()
+   if($paths.Count -ne 1 -or $paths[0] -cne $request.path -or
+      -not [KakaoInput]::FilenameEquals($edit,'') -or
+      [KakaoInput]::GetClipboardSequenceNumber() -ne $request.sequence){throw 'Legacy draft or file clipboard changed'}
+   $null=FileRoom
+   if(-not [KakaoInput]::IsChild([IntPtr]$request.hwnd,$edit)){throw 'Legacy input changed'}
+   $script:dispatched=$true
+   if(-not [KakaoInput]::PasteFile([IntPtr]$request.hwnd,$edit,$request.sequence)){throw 'Could not submit file paste'}
+   return
+  }
   Ctrl 84
  }
  SelectFilePath

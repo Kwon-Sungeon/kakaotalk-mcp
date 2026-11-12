@@ -50,7 +50,8 @@ def test_find_chat_window_found(mock_gui):
         callback(99999, None)
 
     mock_gui.EnumWindows.side_effect = enum_side_effect
-    result = controller.find_chat_window("TestRoom")
+    with patch.object(controller, "_is_chat_window", return_value=True):
+        result = controller.find_chat_window("TestRoom")
     assert result == 99999
 
 
@@ -90,7 +91,8 @@ def test_list_chat_windows(mock_gui):
             callback(hwnd, None)
 
     mock_gui.EnumWindows.side_effect = enum_side_effect
-    result = controller.list_chat_windows()
+    with patch.object(controller, "_is_chat_window", return_value=True):
+        result = controller.list_chat_windows()
     titles = [r["title"] for r in result]
     assert "Room A" in titles
     assert "Room B" in titles
@@ -113,6 +115,7 @@ def test_send_message_success(mock_find, mock_child, mock_api):
     assert isinstance(controller.win32clipboard, Mock)
     from contextlib import ExitStack
     with ExitStack() as stack:
+        stack.enter_context(patch.object(controller, '_native_send_button', return_value=33))
         stack.enter_context(patch.object(controller, '_edit_text', side_effect=['', 'Hello', 'Hello', '']))
         replace = stack.enter_context(patch.object(controller, '_replace_selection'))
         stack.enter_context(patch.object(controller, '_focus_control'))
@@ -300,9 +303,9 @@ def test_wrong_foreground_cannot_paste_or_send():
     with patch.object(controller, 'find_chat_window', return_value=11111), \
             patch.object(controller, 'find_child_window_recursive', return_value=22222), \
             patch.object(controller, '_edit_text', side_effect=['', 'sample']), \
-            patch.object(controller, 'bring_window_to_front'), \
-            pytest.raises(RuntimeError, match='inactive'):
-        controller.send_message_to_room('TestRoom', 'sample')
+            patch.object(controller, 'bring_window_to_front'):
+        result = controller.send_message_to_room('TestRoom', 'sample')
+        assert result['status'] == 'failed_before_send' and 'inactive' in result['error']
     controller.win32clipboard.OpenClipboard.assert_not_called()
     controller._user32.keybd_event.assert_not_called()
     controller._user32.mouse_event.assert_not_called()

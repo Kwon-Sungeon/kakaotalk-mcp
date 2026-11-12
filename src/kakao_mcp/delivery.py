@@ -99,8 +99,19 @@ def file_clipboard(path):
 
 def dispatch(room, kind, value, mention):
     args = room.arguments()
-    if kind == 'file':
-        if room.is_qt:
+    if kind in ('file', 'file_clipboard', 'file_picker'):
+        if kind == 'file_picker' and room.is_qt:
+            error = DeliveryError('unsupported_method', 'Use auto or clipboard for Qt file attachments')
+            error.before_send = True
+            raise error
+        if room.is_qt or kind == 'file_clipboard':
+            if not room.is_qt:
+                edit = legacy.find_child_window_recursive(room.hwnd, config.KAKAO_EDIT_CLASS)
+                if not edit or not legacy._empty_input(edit):
+                    error = DeliveryError('input_not_ready', 'Empty legacy chat input required')
+                    error.before_send = True
+                    raise error
+                args['edit_hwnd'] = edit
             with file_clipboard(value) as sequence:
                 return bridge.request(dict(action='file', path=value, sequence=sequence, **args), 18)
         return bridge.request(dict(action='file', path=value, **args), 22)
@@ -123,6 +134,25 @@ def _journal():
     return sqlite3.connect(directory / 'deliveries.sqlite3')
 
 
+def recent_receipts(limit=20, room_name=None):
+    if not 1 <= limit <= 100:
+        raise DeliveryError('invalid_argument', 'limit must be between 1 and 100')
+    path = Path(os.environ['LOCALAPPDATA'], 'KakaoTalk-MCP', 'deliveries.sqlite3')
+    records = []
+    if path.is_file():
+        with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)) as db:
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='receipts'").fetchone():
+                for request_id, updated, payload in db.execute(
+                        'SELECT id,updated,result FROM receipts ORDER BY updated DESC'):
+                    for index, row in enumerate(json.loads(payload)):
+                        if room_name is None or row['room'] == room_name:
+                            records.append(dict(request_id=request_id, item_index=index, room=row['room'],
+                                                status=row['status'], updated_unix=updated))
+                            if len(records) == limit:
+                                return {'records': records}
+    return {'records': records}
+
+
 def _summary(key, rows, replayed=False):
     for row in rows:
         row['success'] = row['status'] == 'confirmed'
@@ -137,7 +167,20 @@ def _summary(key, rows, replayed=False):
     return result
 
 
-def deliver(kind, entries, *, mention=None, refs=None, request_id=None, interval=0):
+def send_policy():
+    def names(key):
+        return [name.strip() for name in os.environ.get(key, '').replace('\n', ';').split(';') if name.strip()]
+
+    raw = os.environ.get('KAKAO_MCP_MAX_BULK_ROOMS', '').strip()
+    if raw and (not raw.isascii() or not raw.isdecimal() or int(raw) < 1):
+        raise DeliveryError('invalid_policy', 'KAKAO_MCP_MAX_BULK_ROOMS must be a positive integer')
+    return dict(read_only=os.environ.get('KAKAO_MCP_READ_ONLY', '').strip().lower() not in
+                {'', '0', 'false', 'no', 'off'}, allowed_rooms=names('KAKAO_MCP_ALLOWED_ROOMS'),
+                blocked_rooms=names('KAKAO_MCP_BLOCKED_ROOMS'), max_bulk_rooms=int(raw) if raw else None)
+
+
+def deliver(kind, entries, *, mention=None, refs=None, request_id=None, interval=0, dry_run=False,
+            file_method='auto'):
     """Commit uncertainty before dispatch so termination cannot turn into a replay."""
     if kind in {'image', 'file'}:
         entries = [(room, os.fspath(value)) for room, value in entries]
@@ -156,6 +199,18 @@ def deliver(kind, entries, *, mention=None, refs=None, request_id=None, interval
         raise DeliveryError('duplicate_item', 'Duplicate recipients or attachments in a batch')
     if refs and set(refs).difference(room for room, _ in entries):
         raise DeliveryError('invalid_argument', 'Reference supplied for a different room')
+    rules = send_policy()
+    rooms = {room for room, _ in entries}
+    if rules['read_only'] or rooms.intersection(rules['blocked_rooms']) or (
+            rules['allowed_rooms'] and rooms.difference(rules['allowed_rooms'])):
+        raise DeliveryError('policy_denied', 'Sending to one or more requested rooms is disabled by policy')
+    if rules['max_bulk_rooms'] and len(rooms) > rules['max_bulk_rooms']:
+        raise DeliveryError('policy_denied', 'Batch exceeds configured room limit')
+    if dry_run:
+        if kind in {'image', 'file'} and any(not Path(value).is_file() for _, value in entries):
+            raise DeliveryError('invalid_argument', 'All attachment files must exist before sending')
+        return dict(success=True, dry_run=True, status='inputs_validated', room_verified=False,
+                    item_count=len(entries), rooms=list(dict.fromkeys(room for room, _ in entries)))
     payload = json.dumps([kind, entries, mention, refs or {}], sort_keys=True).encode()
     fingerprint = hashlib.sha256(payload).hexdigest()
     key = request_id or 'auto-' + fingerprint
@@ -213,7 +268,8 @@ def deliver(kind, entries, *, mention=None, refs=None, request_id=None, interval
                 # The item fence and its pending receipt must commit together.
                 db.execute('INSERT OR REPLACE INTO items VALUES (?,?,?)', (item, key, index))
                 save()
-                outcome = dispatch(room, kind, value, mention)
+                action = f'file_{file_method}' if kind == 'file' and file_method != 'auto' else kind
+                outcome = dispatch(room, action, value, mention)
                 if not (outcome.get('sent') or outcome.get('success')):
                     row['status'] = outcome.get('status', 'unconfirmed')
                     raise DeliveryError(outcome.get('code', 'send_unconfirmed'), outcome.get('error', 'Send not confirmed'))
