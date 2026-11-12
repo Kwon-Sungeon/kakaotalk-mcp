@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import ctypes
+from contextlib import contextmanager
 from ctypes import wintypes
 import shutil
 import subprocess
@@ -17,6 +18,7 @@ import win32clipboard
 import win32process
 
 from . import config
+from .ui_lock import operation
 
 
 def _log(msg: str):
@@ -112,6 +114,7 @@ def find_child_window_recursive(parent_hwnd: int, class_name: str) -> Optional[i
     return found[0] if found else None
 
 
+@operation()
 def bring_window_to_front(hwnd: int):
     """Restore and bring a window to the foreground.
 
@@ -119,7 +122,6 @@ def bring_window_to_front(hwnd: int):
     and simulates Alt keypress to bypass Windows foreground restrictions.
     """
     VK_MENU = 0x12  # Alt key
-    SW_SHOW = 5
     SW_RESTORE = 9
     HWND_TOPMOST = -1
     HWND_NOTOPMOST = -2
@@ -127,7 +129,12 @@ def bring_window_to_front(hwnd: int):
     SWP_NOSIZE = 0x0001
     SWP_SHOWWINDOW = 0x0040
 
-    _user32.ShowWindow(hwnd, SW_RESTORE)
+    if _user32.GetForegroundWindow() == hwnd:
+        return
+    if _user32.IsIconic(hwnd):
+        _user32.ShowWindow(hwnd, SW_RESTORE)
+    if _user32.SetForegroundWindow(hwnd) and _user32.GetForegroundWindow() == hwnd:
+        return
 
     # Simulate Alt keypress to unlock SetForegroundWindow
     _user32.keybd_event(VK_MENU, 0, 0, 0)
@@ -174,9 +181,10 @@ def _require_focus(window, control):
 
 
 def _edit_text(control):
-    length = win32gui.SendMessage(control, win32con.WM_GETTEXTLENGTH, 0, 0)
+    _, length = win32gui.SendMessageTimeout(control, win32con.WM_GETTEXTLENGTH, 0, 0, win32con.SMTO_ABORTIFHUNG, 1000)
     buffer = ctypes.create_unicode_buffer(length + 1)
-    win32gui.SendMessage(control, win32con.WM_GETTEXT, len(buffer), ctypes.addressof(buffer))
+    win32gui.SendMessageTimeout(control, win32con.WM_GETTEXT, len(buffer), ctypes.addressof(buffer),
+                                win32con.SMTO_ABORTIFHUNG, 1000)
     return buffer.value.replace('\r\n', '\n').replace('\r', '\n')
 
 
@@ -185,13 +193,60 @@ def _click_control(window, control):
     point = ((left + right) // 2, (top + bottom) // 2)
     if _user32.GetForegroundWindow() != window or win32gui.WindowFromPoint(point) != control:
         raise RuntimeError("KakaoTalk target control is covered or inactive")
+    previous = win32gui.GetCursorPos()
     _user32.SetCursorPos(*point)
-    if win32gui.GetCursorPos() != point or win32gui.WindowFromPoint(point) != control:
-        raise RuntimeError("KakaoTalk target moved before click")
-    _user32.mouse_event(2, 0, 0, 0, 0)
-    _user32.mouse_event(4, 0, 0, 0, 0)
+    try:
+        if win32gui.GetCursorPos() != point or win32gui.WindowFromPoint(point) != control:
+            raise RuntimeError("KakaoTalk target moved before click")
+        _user32.mouse_event(2, 0, 0, 0, 0)
+        _user32.mouse_event(4, 0, 0, 0, 0)
+    finally:
+        if win32gui.GetCursorPos() == point:
+            _user32.SetCursorPos(*previous)
     time.sleep(config.EDIT_CLICK_WAIT_SEC)
     _require_focus(window, control)
+
+
+def _native_send_button(window):
+    """A standard, enabled send button can receive BM_CLICK without global input."""
+    if not win32gui.IsWindowEnabled(window):
+        return None
+    buttons = []
+
+    def visit(control, _):
+        if (win32gui.GetClassName(control) == 'Button'
+                and win32gui.GetAncestor(control, win32con.GA_ROOT) == window
+                and win32gui.GetWindowText(control).strip() in {'전송', '보내기'}
+                and win32gui.IsWindowVisible(control) and win32gui.IsWindowEnabled(control)):
+            buttons.append(control)
+        return True
+
+    win32gui.EnumChildWindows(window, visit, None)
+    return buttons[0] if len(buttons) == 1 else None
+
+
+def _focus_control(window, control):
+    """Focus the native control without moving the pointer when supported."""
+    if _user32.GetForegroundWindow() != window:
+        raise RuntimeError("KakaoTalk target control is inactive")
+    try:
+        _require_focus(window, control)
+        return
+    except RuntimeError:
+        pass
+    current = win32api.GetCurrentThreadId()
+    target = _user32.GetWindowThreadProcessId(window, None)
+    if _user32.AttachThreadInput(current, target, True):
+        try:
+            _user32.SetFocus(control)
+        finally:
+            _user32.AttachThreadInput(current, target, False)
+        try:
+            _require_focus(window, control)
+            return
+        except RuntimeError:
+            pass
+    _click_control(window, control)
 
 
 def _press_key(vk: int, shift: bool = False):
@@ -224,6 +279,43 @@ def _send_ctrl_key_combo(vk_key: int):
 # Clipboard helpers
 # ---------------------------------------------------------------------------
 
+def _plain_clipboard_snapshot():
+    """Only snapshot empty or plain-text clipboards that we can reconstruct."""
+    try:
+        win32clipboard.OpenClipboard()
+        try:
+            fmt = 0
+            plain_formats = {win32con.CF_TEXT, win32con.CF_OEMTEXT,
+                             win32con.CF_UNICODETEXT, win32con.CF_LOCALE}
+            for _ in range(win32clipboard.CountClipboardFormats()):
+                fmt = win32clipboard.EnumClipboardFormats(fmt)
+                if fmt not in plain_formats:
+                    return None
+            text = win32clipboard.GetClipboardData(win32con.CF_UNICODETEXT) if fmt else None
+            return win32clipboard.GetClipboardSequenceNumber(), text
+        finally:
+            win32clipboard.CloseClipboard()
+    except Exception:
+        return None
+
+
+def _restore_plain_clipboard(snapshot, before_copy, after_copy):
+    if snapshot is None or snapshot[0] != before_copy or before_copy == after_copy:
+        return
+    try:
+        win32clipboard.OpenClipboard()
+        try:
+            # Compare while holding the clipboard open. A user copy wins.
+            if win32clipboard.GetClipboardSequenceNumber() == after_copy:
+                win32clipboard.EmptyClipboard()
+                if snapshot[1] is not None:
+                    win32clipboard.SetClipboardText(snapshot[1], win32con.CF_UNICODETEXT)
+        finally:
+            win32clipboard.CloseClipboard()
+    except Exception:
+        pass  # Clipboard restoration is best effort.
+
+
 def _read_clipboard_text(max_retries: int = None, interval_sec: float = None) -> str:
     """Read text from clipboard with retry logic."""
     if max_retries is None:
@@ -248,10 +340,11 @@ def _read_clipboard_text(max_retries: int = None, interval_sec: float = None) ->
 # Message sending
 # ---------------------------------------------------------------------------
 
+@operation()
 def send_message_to_room(room_name: str, text: str) -> Dict:
     """Send a text message to a KakaoTalk chat room.
 
-    Pastes text via clipboard into RICHEDIT50W and sends with keybd_event Enter.
+    Fill the native edit control directly, then focus it to send Enter.
     NOTE: This briefly brings the chat window to the foreground.
 
     Returns:
@@ -265,29 +358,41 @@ def send_message_to_room(room_name: str, text: str) -> Dict:
     if edit_hwnd is None:
         return {"success": False, "error": f"Edit control not found in '{room_name}'"}
 
-    # Bring window to foreground and focus the edit control
-    bring_window_to_front(hwnd)
-    time.sleep(config.WINDOW_ACTIVATE_WAIT_SEC)
-
-    # Click on the edit control to ensure focus
-    _click_control(hwnd, edit_hwnd)
-
-    # Paste text via clipboard (handles Korean correctly, unlike WM_SETTEXT on some versions)
     if _edit_text(edit_hwnd):
         return {"success": False, "error": "Chat has an existing draft"}
-    win32clipboard.OpenClipboard()
-    try:
-        win32clipboard.EmptyClipboard()
-        win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
-    finally:
-        win32clipboard.CloseClipboard()
-    time.sleep(config.CLIPBOARD_PASTE_WAIT_SEC)
-    _require_focus(hwnd, edit_hwnd)
-    win32api.SendMessage(edit_hwnd, win32con.WM_PASTE, 0, 0)
-    time.sleep(config.AFTER_PASTE_WAIT_SEC)
-    if _edit_text(edit_hwnd) != text.replace('\r\n', '\n').replace('\r', '\n'):
+
+    expected = text.replace('\r\n', '\n').replace('\r', '\n')
+    # EM_REPLACESEL goes to this Rich Edit and updates its change listeners.
+    win32api.SendMessage(edit_hwnd, win32con.EM_REPLACESEL, 1, expected.replace('\n', '\r\n'))
+    draft = _edit_text(edit_hwnd)
+    if not draft:
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+        finally:
+            win32clipboard.CloseClipboard()
+        win32api.SendMessage(edit_hwnd, win32con.WM_PASTE, 0, 0)
+        draft = _edit_text(edit_hwnd)
+    if draft != expected:
         return {"success": False, "error": "Chat draft changed before send"}
 
+    button = _native_send_button(hwnd)
+    if button:
+        if _edit_text(edit_hwnd) != expected:
+            return {"success": False, "error": "Chat draft changed before send"}
+        win32gui.SendMessageTimeout(button, win32con.BM_CLICK, 0, 0, win32con.SMTO_ABORTIFHUNG, 1000)
+        deadline = time.monotonic() + 1
+        while _edit_text(edit_hwnd):
+            if time.monotonic() >= deadline:
+                return {"success": False, "error": "Send outcome uncertain; do not retry automatically"}
+            time.sleep(0.05)
+        return {"success": True, "message": f"Message sent to '{room_name}'"}
+
+    bring_window_to_front(hwnd)
+    _focus_control(hwnd, edit_hwnd)
+    if _edit_text(edit_hwnd) != expected:
+        return {"success": False, "error": "Chat draft changed before send"}
     _require_focus(hwnd, edit_hwnd)
     # Press Enter using keybd_event (not WM_KEYDOWN — WM_KEYDOWN inserts newline in RICHEDIT)
     _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
@@ -361,7 +466,7 @@ def send_bulk_messages(room_names: List[str], message: str, interval_sec: float 
 # Image sending
 # ---------------------------------------------------------------------------
 
-def _copy_image_to_clipboard(file_path: str):
+def _copy_image_to_clipboard(file_path: str, previous=None):
     """Copy an image file to clipboard as bitmap data (CF_DIB).
 
     Converts the image to BMP via PowerShell/.NET, then sets CF_DIB
@@ -403,8 +508,12 @@ def _copy_image_to_clipboard(file_path: str):
     # CF_DIB = BMP data minus the 14-byte BITMAPFILEHEADER
     dib_data = bmp_data[14:]
 
+    if previous is not None:
+        previous['snapshot'] = _plain_clipboard_snapshot()
     win32clipboard.OpenClipboard()
     try:
+        if previous is not None:
+            previous['before'] = win32clipboard.GetClipboardSequenceNumber()
         win32clipboard.EmptyClipboard()
         win32clipboard.SetClipboardData(win32con.CF_DIB, dib_data)
     finally:
@@ -419,6 +528,17 @@ def _copy_image_to_clipboard(file_path: str):
         win32clipboard.CloseClipboard()
 
 
+@contextmanager
+def temporary_image_clipboard(file_path):
+    previous = {}
+    sequence = _copy_image_to_clipboard(file_path, previous)
+    try:
+        yield sequence
+    finally:
+        _restore_plain_clipboard(previous.get('snapshot'), previous.get('before'), sequence)
+
+
+@operation()
 def send_image_to_room(room_name: str, image_path: str) -> Dict:
     """Send an image file to a KakaoTalk chat room.
 
@@ -445,32 +565,21 @@ def send_image_to_room(room_name: str, image_path: str) -> Dict:
     if edit_hwnd is None:
         return {"success": False, "error": f"Edit control not found in '{room_name}'"}
 
-    # Copy image to clipboard as bitmap (CF_DIB) BEFORE bringing window
-    # to front — clipboard operations don't need foreground focus.
     try:
-        _copy_image_to_clipboard(abs_path)
-    except Exception as e:
-        return {"success": False, "error": f"Failed to copy image to clipboard: {e}"}
+        with temporary_image_clipboard(abs_path) as sequence:
+            return _send_prepared_image(hwnd, edit_hwnd, sequence, room_name, abs_path)
+    except Exception as error:
+        return {"success": False, "error": str(error)}
 
-    # Bring KakaoTalk to front
+
+def _send_prepared_image(hwnd, edit_hwnd, sequence, room_name, abs_path):
     bring_window_to_front(hwnd)
     time.sleep(config.IMAGE_FOCUS_WAIT_SEC)
-
-    # Set keyboard focus to the RICHEDIT edit control using SetFocus.
-    # We use AttachThreadInput so that SetFocus works cross-process.
-    # Mouse click is avoided because it can accidentally hit images
-    # displayed in the chat list area above the edit control.
-    kernel32 = ctypes.windll.kernel32
-    my_tid = kernel32.GetCurrentThreadId()
-    target_tid = _user32.GetWindowThreadProcessId(hwnd, None)
-    _user32.AttachThreadInput(my_tid, target_tid, True)
-    _user32.SetFocus(edit_hwnd)
-    _user32.AttachThreadInput(my_tid, target_tid, False)
-    time.sleep(config.IMAGE_SET_FOCUS_WAIT_SEC)
-
-    # Paste (Ctrl+V) — triggers KakaoTalk's image send confirmation dialog
+    _focus_control(hwnd, edit_hwnd)
     _require_focus(hwnd, edit_hwnd)
-    _send_ctrl_key_combo(0x56)  # Ctrl+V
+    if win32clipboard.GetClipboardSequenceNumber() != sequence:
+        return {"success": False, "error": "Clipboard image changed"}
+    _send_ctrl_key_combo(0x56)
 
     # Wait for the confirmation dialog to appear (it's a separate window).
     # Poll until foreground changes from the chat window or timeout.
@@ -528,8 +637,10 @@ def send_images_to_room(room_name: str, image_paths: List[str]) -> Dict:
 # Message reading
 # ---------------------------------------------------------------------------
 
-def read_chat_messages(room_name: str) -> Dict:
-    """Read messages from a KakaoTalk chat room via Ctrl+A → Ctrl+C.
+@operation()
+def read_chat_messages(room_name: str, read_mode=None, max_messages=None, *, monitoring=False,
+                       all_history=False) -> Dict:
+    """Read the native list text when available, or copy the transcript.
 
     NOTE: This briefly brings the chat window to the foreground.
 
@@ -548,25 +659,54 @@ def read_chat_messages(room_name: str) -> Dict:
             "raw_text": "",
         }
 
+    if read_mode != 'complete':
+        from .parser import parse_chat_text
+        try:
+            raw = _edit_text(list_hwnd)
+        except win32gui.error:
+            raw = ''
+        parsed = parse_chat_text(raw)
+        if parsed['messages']:
+            parsed['read_method'] = 'win32_text'
+            parsed['partial'] = True
+            parsed['room_name'] = room_name
+            if (read_mode == 'background' or
+                    (not all_history and (not max_messages or len(parsed['messages']) >= max_messages))):
+                return {"success": True, "raw_text": raw, "parsed": parsed}
+        if read_mode == 'background':
+            return {"success": False, "error": "The legacy message list exposes no background transcript; use complete mode"}
+        if monitoring:
+            # Copying takes focus even if the user is typing in the same room.
+            idle_ms = (win32api.GetTickCount() - win32api.GetLastInputInfo()) & 0xffffffff
+            if idle_ms < 3000:
+                return {"success": False, "deferred": True, "error": "Waiting for idle input before copying legacy history"}
+
     # Bring the chat window to foreground — required for keybd_event
     bring_window_to_front(hwnd)
     time.sleep(config.WINDOW_ACTIVATE_WAIT_SEC)
 
-    # Click on the list control to ensure it has focus
-    _click_control(hwnd, list_hwnd)
+    # Prefer transferring focus directly to the list.
+    _focus_control(hwnd, list_hwnd)
 
     # Ctrl+A (select all)
     _require_focus(hwnd, list_hwnd)
     _send_ctrl_key_combo(config.VK_A)
     time.sleep(config.KEY_COMBO_WAIT_SEC)
 
-    # Ctrl+C (copy)
+    snapshot = _plain_clipboard_snapshot()
     _require_focus(hwnd, list_hwnd)
+    before = win32clipboard.GetClipboardSequenceNumber()
     _send_ctrl_key_combo(config.VK_C)
     time.sleep(config.KEY_COMBO_WAIT_SEC)
-
-    # Read clipboard
+    after = win32clipboard.GetClipboardSequenceNumber()
+    owner = win32clipboard.GetClipboardOwner()
+    if (before == after or not owner or
+            win32process.GetWindowThreadProcessId(owner)[1] != win32process.GetWindowThreadProcessId(hwnd)[1]):
+        return {"success": False, "error": "KakaoTalk did not publish a fresh transcript"}
     raw_text = _read_clipboard_text()
+    if win32clipboard.GetClipboardSequenceNumber() != after:
+        return {"success": False, "error": "Clipboard changed during transcript copy"}
+    _restore_plain_clipboard(snapshot, before, after)
 
     return {"success": True, "raw_text": raw_text}
 
@@ -659,6 +799,7 @@ def _ensure_foreground(hwnd: int) -> bool:
     return fg == hwnd
 
 
+@operation()
 def search_and_open_room(room_name: str) -> Dict:
     """Search for a chat room in KakaoTalk main window and open it.
 
@@ -935,6 +1076,7 @@ def _decompose_korean(text: str) -> List[tuple]:
 # Mention message sending
 # ---------------------------------------------------------------------------
 
+@operation()
 def send_mention_message(room_name: str, mention_name: str, message: str) -> Dict:
     """Send a message with @mention to a KakaoTalk chat room.
 
@@ -969,7 +1111,7 @@ def send_mention_message(room_name: str, mention_name: str, message: str) -> Dic
     # Bring window to foreground and click on edit control for focus
     bring_window_to_front(hwnd)
     time.sleep(config.MENTION_FOCUS_WAIT_SEC)
-    _click_control(hwnd, edit_hwnd)
+    _focus_control(hwnd, edit_hwnd)
 
     # Type '@' using Shift+2 (keybd_event required to activate mention popup)
     _press_key(0x32, shift=True)
@@ -1027,6 +1169,8 @@ class ChatMonitor:
         self._seen_counts = Counter()
         self._room_name: str = ""
         self._keywords: List[str] = []
+        self.baseline_ready = False
+        self._read_mode = None
         self._poll_interval: float = 5.0
         self._running: bool = False
 
@@ -1034,16 +1178,19 @@ class ChatMonitor:
     def is_running(self) -> bool:
         return self._running and self._thread is not None and self._thread.is_alive()
 
-    def start(self, room_name: str, keywords: List[str], poll_interval: float = 5.0) -> Dict:
+    def start(self, room_name: str, keywords: List[str], poll_interval: float = 5.0, read_mode=None) -> Dict:
         """Start monitoring a chat room for keywords."""
         if self.is_running:
             return {"success": False, "error": "Monitor already running"}
 
         self._room_name = room_name
+        self._read_mode = read_mode
         self._keywords = [kw.lower() for kw in keywords]
         self._poll_interval = max(3.0, poll_interval)
         self._stop_event.clear()
-        self._events.clear()
+        with self._events_lock:
+            self._events.clear()
+        self.baseline_ready = False
         self._seen_counts.clear()
         self._running = True
 
@@ -1059,6 +1206,7 @@ class ChatMonitor:
 
         return {
             "success": True,
+            "baseline_ready": self.baseline_ready,
             "message": f"Monitoring '{room_name}' for keywords: {keywords} (interval: {self._poll_interval}s)",
         }
 
@@ -1086,11 +1234,14 @@ class ChatMonitor:
     def _load_initial_messages(self):
         from . import backend, parser
 
-        result = backend.read_chat_messages(self._room_name)
+        result = backend.read_chat_messages(self._room_name, self._read_mode, monitoring=True)
+        if result.get('deferred'):
+            return
         if not result["success"]:
             raise RuntimeError(result["error"])
         parsed = result.get('parsed') or parser.parse_chat_text(result["raw_text"])
         self._seen_counts.update(self._message_key(msg) for msg in parsed["messages"])
+        self.baseline_ready = True
 
     def _monitor_loop(self):
         """Background polling loop."""
@@ -1108,7 +1259,7 @@ class ChatMonitor:
     def _check_for_new_messages(self):
         """Poll for new messages and check for keyword matches."""
         from . import backend
-        result = backend.read_chat_messages(self._room_name)
+        result = backend.read_chat_messages(self._room_name, self._read_mode, monitoring=True)
         if not result["success"]:
             return
 
@@ -1124,6 +1275,9 @@ class ChatMonitor:
             if counts[key] > self._seen_counts[key]:
                 new_messages.append(msg)
         self._seen_counts |= counts
+        if not self.baseline_ready:
+            self.baseline_ready = True
+            return
 
         if not new_messages:
             return
@@ -1138,6 +1292,8 @@ class ChatMonitor:
                     event = {
                         "keyword": kw,
                         "trigger_message": msg,
+                        "read_method": parsed.get("read_method", "clipboard"),
+                        "partial": parsed.get("partial", False),
                         "recent_context": all_messages[context_start:],
                         "room_name": self._room_name,
                     }

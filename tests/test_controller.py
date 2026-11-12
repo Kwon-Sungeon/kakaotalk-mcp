@@ -113,15 +113,14 @@ def test_send_message_success(mock_find, mock_child, mock_api):
     assert isinstance(controller.win32clipboard, Mock)
     from contextlib import ExitStack
     with ExitStack() as stack:
-        stack.enter_context(patch.object(controller, '_edit_text', side_effect=['', 'Hello']))
-        stack.enter_context(patch.object(controller, '_click_control'))
+        stack.enter_context(patch.object(controller, '_edit_text', side_effect=['', 'Hello', 'Hello']))
+        stack.enter_context(patch.object(controller, '_focus_control'))
         stack.enter_context(patch.object(controller, '_require_focus'))
         result = controller.send_message_to_room("TestRoom", "Hello")
     assert result["success"] is True
     assert "sent" in result["message"].lower()
-    controller.win32clipboard.SetClipboardText.assert_called_once_with(
-        "Hello", controller.win32clipboard.CF_UNICODETEXT
-    )
+    controller.win32clipboard.OpenClipboard.assert_not_called()
+    mock_api.SendMessage.assert_called_once_with(22222, controller.win32con.EM_REPLACESEL, 1, "Hello")
 
 
 @patch("kakao_mcp.controller.find_chat_window")
@@ -156,9 +155,11 @@ def test_read_messages_success(mock_find, mock_child, mock_gui, mock_user32, moc
     mock_find.return_value = 11111
     mock_child.return_value = 33333
     mock_gui.GetWindowRect.return_value = (0, 0, 100, 100)
+    controller.win32clipboard.CountClipboardFormats.return_value = 0
+    controller.win32clipboard.GetClipboardSequenceNumber.side_effect = [1, 1, 2, 2, 2]
     mock_clip.return_value = "[Room] [대화상대 2명]\n[A] [오전 10:00] Hello"
-    with patch.object(controller, "_click_control"), patch.object(controller, "_require_focus"):
-        result = controller.read_chat_messages("Room")
+    with patch.object(controller, "_focus_control"), patch.object(controller, "_require_focus"):
+        result = controller.read_chat_messages("Room", "complete")
     assert result["success"] is True
     assert "Hello" in result["raw_text"]
 
@@ -253,7 +254,8 @@ def test_send_image_success(mock_abs, mock_isfile, mock_split, mock_find,
     # Simulate dialog appearing (foreground changes to a different window)
     mock_user32.GetForegroundWindow.side_effect = [11111, 33333, 33333]
     mock_win32gui.GetWindow.return_value = 11111
-    with patch.object(controller, "_require_focus"):
+    controller.win32clipboard.GetClipboardSequenceNumber.return_value = mock_copy.return_value
+    with patch.object(controller, "_focus_control"), patch.object(controller, "_require_focus"):
         result = controller.send_image_to_room("TestRoom", "C:\\test\\image.jpg")
     assert result["success"] is True
     assert "sent" in result["message"].lower()
@@ -292,9 +294,22 @@ def test_wrong_foreground_cannot_paste_or_send():
     controller._user32.GetForegroundWindow.return_value = 33333
     with patch.object(controller, 'find_chat_window', return_value=11111), \
             patch.object(controller, 'find_child_window_recursive', return_value=22222), \
+            patch.object(controller, '_edit_text', side_effect=['', 'sample']), \
             patch.object(controller, 'bring_window_to_front'), \
             pytest.raises(RuntimeError, match='inactive'):
         controller.send_message_to_room('TestRoom', 'sample')
     controller.win32clipboard.OpenClipboard.assert_not_called()
     controller._user32.keybd_event.assert_not_called()
     controller._user32.mouse_event.assert_not_called()
+
+def test_native_send_button_does_not_activate_window():
+    with patch.object(controller, 'find_chat_window', return_value=11), \
+            patch.object(controller, 'find_child_window_recursive', return_value=22), \
+            patch.object(controller, '_native_send_button', return_value=33), \
+            patch.object(controller, '_edit_text', side_effect=['', 'sample', 'sample', '']), \
+            patch.object(controller, 'bring_window_to_front') as activate:
+        assert controller.send_message_to_room('fixture', 'sample')['success']
+    activate.assert_not_called()
+    controller.win32gui.SendMessageTimeout.assert_called_once_with(
+        33, controller.win32con.BM_CLICK, 0, 0, controller.win32con.SMTO_ABORTIFHUNG, 1000)
+    controller._user32.keybd_event.assert_not_called()

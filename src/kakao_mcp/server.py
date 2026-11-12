@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 """MCP Server for KakaoTalk PC automation via Windows UI Automation or Win32."""
 import os
-from typing import Dict, Optional
+from typing import Dict, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
 
 from kakao_mcp import backend as controller
 from kakao_mcp import parser
 from kakao_mcp import config
+
+ReadMode = Literal["auto", "background", "complete"]
 
 app = FastMCP(
     "kakao-mcp-server",
@@ -51,9 +53,9 @@ def kakao_list_open_rooms() -> Dict:
 
 
 @app.tool()
-def kakao_open_room(room_name: str) -> Dict:
-    """Open or bring to front a KakaoTalk chat room by name.
-    If the chat window is already open, brings it to foreground.
+def kakao_open_room(room_name: str, focus: bool = False) -> Dict:
+    """Open a KakaoTalk chat room by name. An existing room keeps its position.
+    Set focus=true when the user wants to see the room.
     If not, searches for the room in KakaoTalk's search bar.
 
     Args:
@@ -62,10 +64,13 @@ def kakao_open_room(room_name: str) -> Dict:
     try:
         hwnd = controller.find_chat_window(room_name)
         if hwnd:
-            controller.bring_window_to_front(hwnd)
-            return {"message": f"Chat room '{room_name}' brought to foreground", "hwnd": hwnd}
+            if focus:
+                controller.bring_window_to_front(hwnd)
+            return {"message": f"Chat room '{room_name}' is open", "hwnd": hwnd}
         result = controller.search_and_open_room(room_name)
         if result["success"]:
+            if focus and result.get("hwnd"):
+                controller.bring_window_to_front(result["hwnd"])
             return {"message": result["message"], "hwnd": result.get("hwnd")}
         return {"error": result["error"]}
     except Exception as e:
@@ -151,11 +156,13 @@ def kakao_send_image(room_name: str, image_paths: list[str]) -> Dict:
 
 
 @app.tool()
-def kakao_read_messages(room_name: str, max_messages: int = 50) -> Dict:
+def kakao_read_messages(room_name: str, max_messages: Optional[int] = None, read_mode: Optional[ReadMode] = None) -> Dict:
     """Read recent messages from a KakaoTalk chat room.
     Reads locally loaded messages using the selected UI backend.
-    Qt complete mode uses UIA-targeted copy to retain sender/time metadata.
-    KAKAO_QT_READ_MODE=uia reads exposed UIA messages without clipboard/focus.
+    With no count, auto prefers the exposed conversation (up to 50). Specify a
+    count to fill missing history or metadata using a full copy when needed.
+    Use background for exposed messages without input or clipboard, even if partial.
+    Use complete for all locally loaded detail; it may activate the room and copy.
     partial indicates that server-only history may not be included.
 
     Args:
@@ -163,13 +170,14 @@ def kakao_read_messages(room_name: str, max_messages: int = 50) -> Dict:
         max_messages: Maximum number of recent messages to return (default 50).
     """
     try:
-        if max_messages < 1:
+        if max_messages is not None and max_messages < 1:
             return {"error": "max_messages must be positive"}
-        result = controller.read_chat_messages(room_name)
+        result = controller.read_chat_messages(room_name, read_mode, max_messages)
         if not result["success"]:
             return {"error": result["error"]}
         parsed = result.get('parsed') or parser.parse_chat_text(result["raw_text"])
         messages = parsed["messages"]
+        max_messages = max_messages or 50
         if len(messages) > max_messages:
             messages = messages[-max_messages:]
         return {
@@ -179,21 +187,25 @@ def kakao_read_messages(room_name: str, max_messages: int = 50) -> Dict:
             "messages": messages,
             "partial": parsed.get("partial", False),
             "read_method": parsed.get("read_method", "clipboard"),
+            "unknown_fields": parsed.get("unknown_fields", []),
+            **({"at_end": parsed["at_end"]} if "at_end" in parsed else {}),
+            **({"detail_error": parsed["detail_error"]} if "detail_error" in parsed else {}),
         }
     except Exception as e:
         return {"error": f"Failed to read messages: {e}"}
 
 
 @app.tool()
-def kakao_extract_links(room_name: str) -> Dict:
+def kakao_extract_links(room_name: str, read_mode: Optional[ReadMode] = None) -> Dict:
     """Extract all URLs/links from messages in a KakaoTalk chat room.
-    Reads the chat first, then extracts URLs from all messages.
+    Auto and complete request the full locally loaded transcript. Background
+    extracts links only from messages available without foreground interaction.
 
     Args:
         room_name: Exact title of the chat room window.
     """
     try:
-        result = controller.read_chat_messages(room_name)
+        result = controller.read_chat_messages(room_name, read_mode, all_history=True)
         if not result["success"]:
             return {"error": result["error"]}
         parsed = result.get('parsed') or parser.parse_chat_text(result["raw_text"])
@@ -201,6 +213,7 @@ def kakao_extract_links(room_name: str) -> Dict:
         return {
             "message": f"Found {len(urls)} URL(s) in '{room_name}'",
             "links": urls,
+            "read_method": parsed.get("read_method", "clipboard"),
             "partial": parsed.get("partial", False),
         }
     except Exception as e:
@@ -263,11 +276,14 @@ def kakao_start_monitor(
     room_name: str,
     keywords: list[str],
     poll_interval_sec: float = 5.0,
+    read_mode: Optional[ReadMode] = None,
 ) -> Dict:
     """Start monitoring a KakaoTalk chat room for keyword matches.
     Runs in background, checking for new messages at the specified interval.
     Use kakao_get_monitor_events() to retrieve detected keyword matches.
-    NOTE: The chat room window must be open. Polling brings it to foreground briefly.
+    Keep the room open. Qt auto monitors exposed UIA messages without input.
+    Complete monitors local history and may activate the room on each poll.
+    Legacy auto uses the chat control first, then copies when necessary.
 
     Args:
         room_name: Exact title of the chat room window to monitor.
@@ -277,9 +293,9 @@ def kakao_start_monitor(
     try:
         if not keywords:
             return {"error": "Keywords list cannot be empty"}
-        result = controller._chat_monitor.start(room_name, keywords, poll_interval_sec)
+        result = controller._chat_monitor.start(room_name, keywords, poll_interval_sec, read_mode)
         if result["success"]:
-            return {"message": result["message"]}
+            return {"message": result["message"], "baseline_ready": result["baseline_ready"]}
         return {"error": result["error"]}
     except Exception as e:
         return {"error": f"Failed to start monitor: {e}"}
@@ -313,6 +329,7 @@ def kakao_get_monitor_events() -> Dict:
         events = controller._chat_monitor.get_events()
         return {
             "monitoring": is_running,
+            "baseline_ready": is_running and controller._chat_monitor.baseline_ready,
             "event_count": len(events),
             "events": events,
         }

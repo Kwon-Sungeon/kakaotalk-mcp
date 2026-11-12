@@ -67,10 +67,16 @@ Test-Mention @('Lee') '@Lee ' '' $false $true 0 '*draft changed*'
 # viewer that predates this operation.
 $openPhoto = $ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'OpenPhoto'},$true)
 foreach($command in $openPhoto.FindAll({param($n) $n -is [Management.Automation.Language.CommandAst]},$true)){
- if($command.GetCommandName() -notin 'Windows','Where-Object','Click','Start-Sleep'){throw "Unmocked command: $command"}
+ if($command.GetCommandName() -notin 'Windows','Where-Object','Click','Room','Front','WaitFor','TryInvoke','Start-Sleep'){throw "Unmocked command: $command"}
 }
 . ([scriptblock]::Create($openPhoto.Extent.Text))
 $script:viewerOpen=$false
+$script:supportsInvoke=$false
+function TryInvoke($element){
+ if($script:supportsInvoke){$script:viewerOpen=$true; return $true}
+ return $false
+}
+function WaitFor($lookup,$timeout){& $lookup}
 function Windows {
  if($script:viewerOpen){@{Current=@{Name='fixture';ClassName='ChatMediaCollectionView'}}}
 }
@@ -82,4 +88,7 @@ if((OpenPhoto 'photo' 'fixture').Current.Name -ne 'fixture'){throw 'Missing view
 $failure=''
 try {OpenPhoto 'photo' 'fixture'} catch {$failure=$_.Exception.Message}
 if($failure -notlike '*existing room photo viewer*'){throw 'Unexpected existing viewer handling'}
-'2 isolated photo viewer scenarios passed'
+$script:viewerOpen=$false
+$script:supportsInvoke=$true
+if((OpenPhoto 'photo' 'fixture').Current.Name -ne 'fixture'){throw 'Missing invoked viewer'}
+'3 isolated photo viewer scenarios passed'

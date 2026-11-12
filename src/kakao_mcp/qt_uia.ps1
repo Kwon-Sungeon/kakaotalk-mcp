@@ -8,8 +8,24 @@ using System.Runtime.InteropServices;
 public class KakaoInput {
  [StructLayout(LayoutKind.Sequential)] public struct Point {public int X; public int Y;}
  [DllImport("user32.dll")] public static extern bool GetCursorPos(out Point p);
+ public static Point Cursor(){Point p; if(!GetCursorPos(out p)) throw new InvalidOperationException("Cursor unavailable"); return p;}
+ [StructLayout(LayoutKind.Sequential)] private struct LastInput { public uint Size; public uint Tick; }
+ [DllImport("user32.dll")] private static extern bool GetLastInputInfo(ref LastInput info);
+ public static uint InputTick(){var info=new LastInput{Size=8}; if(!GetLastInputInfo(ref info)) throw new InvalidOperationException("Input time unavailable"); return info.Tick;}
+ [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
+ [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr SendMessageTimeoutW(IntPtr hwnd,uint message,IntPtr w,IntPtr l,uint flags,uint timeout,out IntPtr result);
+ public static bool ReplaceFilename(IntPtr hwnd,string text){
+  IntPtr result;
+  if(hwnd==IntPtr.Zero || SendMessageTimeoutW(hwnd,0xB1,IntPtr.Zero,new IntPtr(-1),2,500,out result)==IntPtr.Zero) return false;
+  IntPtr value=Marshal.StringToHGlobalUni(text);
+  try { return SendMessageTimeoutW(hwnd,0xC2,new IntPtr(1),value,2,500,out result)!=IntPtr.Zero; }
+  finally { Marshal.FreeHGlobal(value); }
+ }
  public static bool CursorAt(int x,int y){Point p; return GetCursorPos(out p) && p.X == x && p.Y == y;}
  [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
+ [DllImport("user32.dll")] private static extern IntPtr GetClipboardOwner();
+ [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hwnd,out uint pid);
+ public static uint ClipboardOwnerPid(){uint pid; GetWindowThreadProcessId(GetClipboardOwner(),out pid); return pid;}
  [DllImport("user32.dll")] public static extern void keybd_event(byte k,byte s,uint f,UIntPtr e);
  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
@@ -39,15 +55,19 @@ function Main {
 function Room($name) {
  $w = @(Windows | Where-Object {$_.Current.ClassName -match 'ChatWindow' -and $_.Current.Name -ceq $name})
  if($w.Count -ne 1){throw "Expected one open chat named '$name'; found $($w.Count)"}
- if($request.hwnd -and $w[0].Current.NativeWindowHandle -ne $request.hwnd){throw "Target room window changed"}
+ $handle=$w[0].Current.NativeWindowHandle
+ if(($request.hwnd -and $handle -ne $request.hwnd) -or ($script:roomHwnd -and $handle -ne $script:roomHwnd)){throw 'Target room window changed'}
+ $script:roomHwnd=$handle
  $w[0]
 }
 function Front($w) {
  $script:targetHwnd=[IntPtr]$w.Current.NativeWindowHandle
- [void][KakaoInput]::ShowWindow([IntPtr]$w.Current.NativeWindowHandle,9)
+ if([KakaoInput]::GetForegroundWindow() -eq $script:targetHwnd){return}
+ if([KakaoInput]::IsIconic($script:targetHwnd)){[void][KakaoInput]::ShowWindow($script:targetHwnd,9)}
  [void][KakaoInput]::SetForegroundWindow([IntPtr]$w.Current.NativeWindowHandle)
  if([KakaoInput]::GetForegroundWindow() -ne $script:targetHwnd){
   [KakaoInput]::keybd_event(18,0,0,[UIntPtr]::Zero);[KakaoInput]::keybd_event(18,0,2,[UIntPtr]::Zero)
+  $script:lastInput=[KakaoInput]::InputTick()
   [void][KakaoInput]::SetForegroundWindow([IntPtr]$w.Current.NativeWindowHandle)
  }
  Start-Sleep -Milliseconds 200
@@ -69,28 +89,51 @@ function Click($element, [bool]$double=$false) {
  if($r.IsEmpty -or $element.Current.IsOffscreen){throw 'Target is offscreen'}
  $x=[int]($r.Left+$r.Width/2);$y=[int]($r.Top+$r.Height/2)
  AssertHit $element $x $y
- if(-not [KakaoInput]::SetCursorPos($x,$y)){throw 'Could not position cursor'}
- Start-Sleep -Milliseconds 50
- $count=if($double){2}else{1}
- for($n=0;$n -lt $count;$n++){
-  if(-not [KakaoInput]::CursorAt($x,$y)){throw 'Pointer moved before click'}
-  AssertHit $element $x $y
-  [KakaoInput]::mouse_event(2,0,0,0,[UIntPtr]::Zero)
-  [KakaoInput]::mouse_event(4,0,0,0,[UIntPtr]::Zero)
-  if($n+1 -lt $count){Start-Sleep -Milliseconds 50}
+ $previous=[KakaoInput]::Cursor()
+ try {
+  if(-not [KakaoInput]::SetCursorPos($x,$y)){throw 'Could not position cursor'}
+  Start-Sleep -Milliseconds 50
+  $count=if($double){2}else{1}
+  for($n=0;$n -lt $count;$n++){
+   if(-not [KakaoInput]::CursorAt($x,$y)){throw 'Pointer moved before click'}
+   AssertHit $element $x $y
+   [KakaoInput]::mouse_event(2,0,0,0,[UIntPtr]::Zero)
+   [KakaoInput]::mouse_event(4,0,0,0,[UIntPtr]::Zero)
+   $script:lastInput=[KakaoInput]::InputTick()
+   if($n+1 -lt $count){Start-Sleep -Milliseconds 50}
+  }
+ } finally {
+  if([KakaoInput]::CursorAt($x,$y)){[void][KakaoInput]::SetCursorPos($previous.X,$previous.Y)}
  }
  Start-Sleep -Milliseconds 250
 }
 function Value($e){$e.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)}
 function Invoke($e){$e.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()}
+function TryInvoke($element) {
+ $pattern=$null
+ if($null -eq $element -or -not $element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$pattern)){return $false}
+ try {$pattern.Invoke()}
+ catch [System.InvalidOperationException] {return $false}
+ catch [System.Runtime.InteropServices.COMException] {return $false}
+ return $true
+}
+function WaitFor($lookup, [int]$milliseconds) {
+ $deadline=[DateTime]::UtcNow.AddMilliseconds($milliseconds)
+ do {
+  $found=@(& $lookup)
+  if($found.Count){return $found}
+  Start-Sleep -Milliseconds 80
+ } while([DateTime]::UtcNow -lt $deadline)
+}
 function Key([byte]$key){
  if([KakaoInput]::GetForegroundWindow() -ne $script:targetHwnd){throw 'KakaoTalk lost keyboard focus'}
  [KakaoInput]::keybd_event($key,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 20; [KakaoInput]::keybd_event($key,0,2,[UIntPtr]::Zero)
+ $script:lastInput=[KakaoInput]::InputTick()
 }
 function Ctrl([byte]$key){
  if([KakaoInput]::GetForegroundWindow() -ne $script:targetHwnd){throw 'KakaoTalk lost keyboard focus'}
  [KakaoInput]::keybd_event(17,0,0,[UIntPtr]::Zero)
- try {Key $key} finally {[KakaoInput]::keybd_event(17,0,2,[UIntPtr]::Zero)}
+ try {Key $key} finally {[KakaoInput]::keybd_event(17,0,2,[UIntPtr]::Zero); $script:lastInput=[KakaoInput]::InputTick()}
 }
 function PasteText($element, [string]$text) {
  Add-Type -AssemblyName System.Windows.Forms
@@ -116,13 +159,17 @@ function SavePhoto($viewer, [string]$path) {
  }
  if(-not $dialog){throw 'Photo save dialog not found'}
  try {
-  Front $dialog
   $field=Children $dialog | Where-Object {$_.Current.AutomationId -eq '1001' -and $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit} | Select-Object -First 1
   $suggested=[IO.Path]::GetExtension((Value $field).Current.Value)
   if($suggested -match '^\.(jpg|jpeg|png|gif|bmp|webp|heic|heif)$'){$path=[IO.Path]::ChangeExtension($path,$suggested)}
-  $field.SetFocus(); Ctrl 65; PasteText $field $path
+  $editHwnd=[IntPtr]$field.Current.NativeWindowHandle
+  $direct=$field.Current.ClassName -eq 'Edit' -and [KakaoInput]::ReplaceFilename($editHwnd,$path)
+  if(-not $direct -or (Value $field).Current.Value -cne $path){
+   Front $dialog
+   $field.SetFocus(); Ctrl 65; PasteText $field $path
+   Key 9
+  }
   if((Value $field).Current.Value -ne $path){throw 'Save filename verification failed'}
-  Key 9
   Invoke (Children $dialog | Where-Object {$_.Current.AutomationId -eq '1' -and $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button} | Select-Object -First 1)
   $deadline=[DateTime]::UtcNow.AddSeconds(5)
   while(-not (Test-Path -LiteralPath $path) -and [DateTime]::UtcNow -lt $deadline){Start-Sleep -Milliseconds 100}
@@ -170,14 +217,14 @@ function VisibleCenter($window, $element) {
 function OpenPhoto($photo, $roomName) {
  $viewerFilter={$_.Current.ClassName -like 'ChatMediaCollection*' -and $_.Current.Name -ceq $roomName}
  if(Windows | Where-Object $viewerFilter){throw 'Close the existing room photo viewer first'}
- # Qt opens the photo viewer on the first release. A second click could
- # land on the new viewer instead of the photo in the chat.
- Click $photo
- $deadline=[DateTime]::UtcNow.AddSeconds(3)
- do {
-  $viewers=@(Windows | Where-Object $viewerFilter)
-  if(-not $viewers.Count){Start-Sleep -Milliseconds 100}
- } while(-not $viewers.Count -and [DateTime]::UtcNow -lt $deadline)
+ $lookup={Windows | Where-Object $viewerFilter}
+ $viewers=@()
+ if(TryInvoke $photo){$viewers=@(WaitFor $lookup 1000)}
+ if(-not $viewers.Count){
+  Front (Room $roomName)
+  if(-not (Windows | Where-Object $viewerFilter)){Click $photo}
+  $viewers=@(WaitFor $lookup 3000)
+ }
  if($viewers.Count -ne 1){throw 'Unique target photo viewer not found'}
  return $viewers[0]
 }
@@ -224,6 +271,8 @@ function Messages($w) {
 }
 try {
  if(-not $script:process){throw 'KakaoTalkUI is not running'}
+ $previousWindow=[KakaoInput]::GetForegroundWindow()
+ $script:lastInput=[KakaoInput]::InputTick()
  $result = switch ($request.action) {
   'health' { $w=Main; @{running=$true;hwnd=$w.Current.NativeWindowHandle;pid=$script:process.Id} }
   'rooms' { @{rooms=@(Windows | Where-Object {$_.Current.ClassName -match 'ChatWindow'} | ForEach-Object {@{title=$_.Current.Name;hwnd=$_.Current.NativeWindowHandle}})} }
@@ -231,18 +280,37 @@ try {
    $existing=@(Windows | Where-Object {$_.Current.ClassName -match 'ChatWindow' -and $_.Current.Name -ceq $request.room})
    if($existing.Count -eq 1){@{hwnd=$existing[0].Current.NativeWindowHandle}; break}
    if($existing.Count -gt 1){throw 'Multiple open rooms have this name'}
-   $w=Main; Front $w; ChatTab $w
+   $w=Main; ChatTab $w
    $field=Children $w | Where-Object {$_.Current.ClassName -like 'TextField*'} | Select-Object -First 1
-   if(-not $field){Click (Children $w | Where-Object {$_.Current.Name -eq '통합검색 Ctrl+F'} | Select-Object -First 1)}
-   $deadline=[DateTime]::UtcNow.AddSeconds(3)
-   do {$field=Children $w | Where-Object {$_.Current.ClassName -like 'TextField*'} | Select-Object -First 1; if(-not $field){Start-Sleep -Milliseconds 100}} while(-not $field -and [DateTime]::UtcNow -lt $deadline)
+   if(-not $field){
+    $button=Children $w | Where-Object {$_.Current.Name -eq '통합검색 Ctrl+F'} | Select-Object -First 1
+    $lookup={Children $w | Where-Object {$_.Current.ClassName -like 'TextField*'} | Select-Object -First 1}
+    if(TryInvoke $button){$field=WaitFor $lookup 1000}
+    if(-not $field){
+     Front $w
+     if(-not (& $lookup)){Click $button}
+     $field=WaitFor $lookup 3000
+    }
+   }
    if(-not $field){throw 'Search input not found'}
-   (Value $field).SetValue($request.room); Start-Sleep -Milliseconds 600
-   $namePattern='^(?:(?:팀채팅|그룹채팅|나와의 채팅), )?'+[regex]::Escape($request.room)+', '
-   $matches=@(Children $w | Where-Object {$_.Current.ControlType -eq [System.Windows.Automation.ControlType]::ListItem -and ($_.Current.Name -ceq $request.room -or $_.Current.Name -cmatch $namePattern)})
-   if($matches.Count -ne 1){(Value $field).SetValue(''); throw "Expected one exact search result; found $($matches.Count)"}
-   Click $matches[0] $true
-   (Value $field).SetValue('')
+   $searchValue=Value $field
+   $previousQuery=$searchValue.Current.Value
+   try {
+    (Value $field).SetValue($request.room); Start-Sleep -Milliseconds 600
+    $namePattern='^(?:(?:팀채팅|그룹채팅|나와의 채팅), )?'+[regex]::Escape($request.room)+', '
+    $matches=@(Children $w | Where-Object {$_.Current.ControlType -eq [System.Windows.Automation.ControlType]::ListItem -and ($_.Current.Name -ceq $request.room -or $_.Current.Name -cmatch $namePattern)})
+    if($matches.Count -ne 1){throw "Expected one exact search result; found $($matches.Count)"}
+    $lookup={Windows | Where-Object {$_.Current.ClassName -match 'ChatWindow' -and $_.Current.Name -ceq $request.room}}
+    $opened=$null
+    if(TryInvoke $matches[0]){$opened=WaitFor $lookup 1000}
+    if(-not $opened){
+     Front $w
+     if(-not (& $lookup)){Click $matches[0] $true}
+     $opened=WaitFor $lookup 3000
+    }
+   } finally {
+    if($searchValue.Current.Value -ceq $request.room){$searchValue.SetValue($previousQuery)}
+   }
    $opened=Room $request.room
    @{hwnd=$opened.Current.NativeWindowHandle}
   }
@@ -263,14 +331,13 @@ try {
    @{sent=$true}
   }
   'download' {
-   $w=Room $request.room; Front $w
+   $w=Room $request.room
    $photos=@(Children $w | Where-Object {$_.Current.ClassName -like 'ChatLogContentPhoto*'} | Sort-Object {$_.Current.BoundingRectangle.Top})
    $scope='visible_room_photos'
    $failure=$null
    $images=@()
    try {
    for($index=$photos.Count-1;$index -ge 0 -and $images.Count -lt $request.limit;$index--){
-    Front $w
     if(-not (VisibleCenter $w $photos[$index])){
      if(-not (RevealPhoto $w $photos[$index])){continue}
      $scope='loaded_room_photos'
@@ -311,21 +378,49 @@ try {
    if((Value (InputBox $w)).Current.Value){throw 'Mention send outcome uncertain; do not retry automatically'}
    @{sent=$true}
   }
-  'read' { $w=Room $request.room; @{room_name=$w.Current.Name;member_count=$null;messages=@(Messages $w);dates=@();partial=$true;read_method='uia';unknown_fields=@('member_count','sender')} }
+  'read' {
+   $w=Room $request.room
+   $messages=@(Messages $w)
+   $unknown=@('member_count')
+   if($messages | Where-Object {-not $_.sender}){$unknown+='sender'}
+   if($messages | Where-Object {-not $_.date}){$unknown+='date'}
+   # Only trust scroll state from the actual message list, never another panel.
+   $item=Children $w | Where-Object {$_.Current.ClassName -eq 'CommonChatItemDelegate'} | Select-Object -First 1
+   $atEnd=$null
+   while($item -and -not [System.Windows.Automation.Automation]::Compare($item,$w)){
+    $scroll=$null
+    if($item.TryGetCurrentPattern([System.Windows.Automation.ScrollPattern]::Pattern,[ref]$scroll)){
+     $atEnd=(-not $scroll.Current.VerticallyScrollable -or $scroll.Current.VerticalScrollPercent -ge 99.99)
+     break
+    }
+    $item=[System.Windows.Automation.TreeWalker]::RawViewWalker.GetParent($item)
+   }
+   @{room_name=$w.Current.Name;member_count=$null;messages=$messages;dates=@();partial=$true;read_method='uia';unknown_fields=$unknown;at_end=$atEnd}
+  }
   'copy' {
    $w=Room $request.room; Front $w
    $items=@(Children $w | Where-Object {$_.Current.ClassName -eq 'CommonChatItemDelegate'})
    if(-not $items.Count){@{raw_text=''};break}
    $message=$items | Where-Object {(VisibleCenter $w $_) -and $_.Current.Name -notmatch '^날짜 '} | Select-Object -Last 1
    if(-not $message){throw 'No visible message to copy'}
-   Click $message
+   $focused=$false
+   if($message.Current.IsKeyboardFocusable){
+    try {
+     $message.SetFocus()
+     $focused=[System.Windows.Automation.Automation]::Compare($message,[System.Windows.Automation.AutomationElement]::FocusedElement)
+    } catch {$focused=$false}
+   }
+   if(-not $focused){Click $message}
    Add-Type -AssemblyName System.Windows.Forms
-   [System.Windows.Forms.Clipboard]::Clear()
    Ctrl 65; Start-Sleep -Milliseconds 100
+   $sequence=[KakaoInput]::GetClipboardSequenceNumber()
    Ctrl 67; Start-Sleep -Milliseconds 200
+   $copied=[KakaoInput]::GetClipboardSequenceNumber()
+   if($copied -eq $sequence -or [KakaoInput]::ClipboardOwnerPid() -ne $script:process.Id){throw 'KakaoTalk did not copy a new transcript'}
    $text=[System.Windows.Forms.Clipboard]::GetText()
    if(-not $text){throw 'Message copy returned an empty clipboard'}
-   @{raw_text=$text}
+   if([KakaoInput]::GetClipboardSequenceNumber() -ne $copied){throw 'Clipboard changed during transcript copy'}
+   @{raw_text=$text;before_copy=$sequence;after_copy=$copied}
   }
   'send' {
    $w=Room $request.room; $i=InputBox $w; $v=Value $i
@@ -346,4 +441,12 @@ try {
   default {throw "Unknown action $($request.action)"}
  }
  @{success=$true;data=$result} | ConvertTo-Json -Depth 14 -Compress
-} catch { @{success=$false;error=$_.Exception.Message} | ConvertTo-Json -Compress }
+} catch { @{success=$false;error=$_.Exception.Message} | ConvertTo-Json -Compress } finally {
+ if($request.action -in 'copy','image','mention','download' -and $script:targetHwnd -and
+     $previousWindow -ne [IntPtr]::Zero -and [KakaoInput]::InputTick() -eq $script:lastInput){
+  $current=[KakaoInput]::GetForegroundWindow()
+  if($current -eq [IntPtr]$script:roomHwnd -and $current -ne $previousWindow){
+   [void][KakaoInput]::SetForegroundWindow($previousWindow)
+  }
+ }
+}

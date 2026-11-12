@@ -1,62 +1,18 @@
 """Qt KakaoTalk backend using Windows UI Automation and scoped keyboard input."""
-import contextlib
 import json
 import os
 from pathlib import Path
 import subprocess
-import tempfile
-import threading
 import time
 
-import msvcrt
 import win32gui
 
 from . import controller as legacy
-
-_thread_lock = threading.RLock()
-_lock_state = threading.local()
-
-
-@contextlib.contextmanager
-def operation():
-    """Serialize UI operations across clients as well as monitor threads."""
-    with _thread_lock:
-        if getattr(_lock_state, 'held', False):
-            yield
-            return
-        path = Path(tempfile.gettempdir()) / 'kakao-mcp-ui.lock'
-        with path.open('a+b') as stream:
-            if stream.seek(0, 2) == 0:
-                stream.write(b'0')
-                stream.flush()
-            deadline = time.monotonic() + 60
-            while True:
-                stream.seek(0)
-                try:
-                    msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
-                    break
-                except OSError:
-                    if time.monotonic() >= deadline:
-                        raise TimeoutError('Another KakaoTalk operation is busy')
-                    time.sleep(.1)
-            try:
-                _lock_state.held = True
-                yield
-            finally:
-                _lock_state.held = False
-                stream.seek(0)
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-
+from .ui_lock import operation
 
 def call(action, **arguments):
     script = Path(__file__).with_name('qt_uia.ps1').read_text(encoding='utf-8')
     with operation():
-        if action in {'copy', 'download', 'image', 'mention'}:
-            hwnd = find_chat_window(arguments['room'])
-            if hwnd is None:
-                raise ValueError('Target room is not open')
-            legacy.bring_window_to_front(hwnd)
-            arguments['hwnd'] = hwnd
         # Windows PowerShell 5.1 reads BOM-less scripts in the system code page
         # with -File. Supply the Unicode script and send request data on stdin.
         command = "[Console]::InputEncoding=[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); " + script
@@ -120,22 +76,49 @@ def send_message_to_room(room_name, text):
         return {'success': False, 'error': str(error)}
 
 
-def read_chat_messages(room_name):
+def read_chat_messages(room_name, read_mode=None, max_messages=None, *, monitoring=False, all_history=False):
+    mode = read_mode or os.environ.get('KAKAO_QT_READ_MODE', 'auto')
+    if mode == 'uia':  # Existing installations used this name.
+        mode = 'background'
+    exposed = {}
+    if monitoring and mode == 'auto':
+        mode = 'background'
     try:
         with operation():
-            if os.environ.get('KAKAO_QT_READ_MODE', 'complete') == 'uia':
+            if mode not in {'auto', 'complete', 'background'}:
+                raise ValueError(f'Unknown read mode: {mode}')
+            if mode == 'background':
                 return {'success': True, 'parsed': call('read', room=room_name)}
+            # A request for all links/history needs the full local copy. A
+            # bounded read can use the exposed tail when it has enough detail.
+            if mode == 'auto' and not all_history:
+                try:
+                    exposed = call('read', room=room_name)
+                except (RuntimeError, subprocess.TimeoutExpired):
+                    pass
+                messages = exposed.get('messages', [])
+                if max_messages is None and messages and exposed.get('at_end') is not False:
+                    return {'success': True, 'parsed': exposed}
+                tail = messages[-max_messages:] if max_messages else []
+                if (exposed.get('at_end') and len(tail) == max_messages
+                        and all(m.get('sender') and m.get('date') for m in tail)):
+                    return {'success': True, 'parsed': exposed}
             from .parser import parse_chat_text
-            raw = call('copy', room=room_name)['raw_text']
+            snapshot = legacy._plain_clipboard_snapshot()
+            copied = call('copy', room=room_name)
+            legacy._restore_plain_clipboard(snapshot, copied.get('before_copy'), copied.get('after_copy'))
+            raw = copied['raw_text']
             parsed = parse_chat_text(raw)
             if raw and not parsed['messages']:
                 raise RuntimeError('Message copy returned no parseable messages')
             parsed['room_name'] = room_name
-            # KakaoTalk exports locally loaded history, not server-only history.
             parsed['partial'] = True
             parsed['read_method'] = 'uia_clipboard'
+            parsed['unknown_fields'] = ['member_count'] if parsed['member_count'] is None else []
             return {'success': True, 'parsed': parsed}
     except Exception as error:
+        if mode == 'auto' and exposed.get('messages'):
+            return {'success': True, 'parsed': {**exposed, 'partial': True, 'detail_error': str(error)}}
         return {'success': False, 'error': str(error), 'raw_text': ''}
 
 
@@ -164,11 +147,14 @@ def send_images_to_room(room_name, image_paths):
         return {'success': False, 'error': 'All paths must be existing supported image files', 'results': []}
     results = []
     try:
-        for path in paths:
-            with operation():
-                sequence = legacy._copy_image_to_clipboard(str(path))
-                data = call('image', room=room_name, sequence=sequence)
-            results.append({'path': str(path), **data})
+        with operation():
+            hwnd = find_chat_window(room_name)
+            if hwnd is None:
+                raise ValueError('Target room is not open')
+            for path in paths:
+                with legacy.temporary_image_clipboard(str(path)) as sequence:
+                    data = call('image', room=room_name, hwnd=hwnd, sequence=sequence)
+                results.append({'path': str(path), **data})
         return {'success': True, 'message': f"Sent {len(paths)} image(s) to '{room_name}'", 'results': results}
     except Exception as error:
         return {'success': False, 'error': str(error), 'results': results}
