@@ -43,26 +43,26 @@ Codex, Claude Desktop, Claude Code 등 MCP 클라이언트에서 카카오톡 �
 
 ## 설치
 
-Qt 지원 버전은 이 브랜치를 내려받아 가상 환경에서 `python -m pip install -e .`로 설치합니다. 아래 uvx 및 PyPI 설치 예시는 게시된 릴리스를 사용합니다.
+v0.3.0은 구형 Win32와 신형 Qt 카카오톡을 함께 지원합니다. 아래 명령은 GitHub Release의 공통 패키지를 사용합니다.
 
 ### uvx
 
 별도 설치 없이 바로 실행:
 
 ```bash
-uvx kakaotalk-mcp
+uvx --from https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.3.0/kakaotalk_mcp-0.3.0-py3-none-any.whl kakaotalk-mcp
 ```
 
 ### pip
 
 ```bash
-pip install kakaotalk-mcp
+python -m pip install "https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.3.0/kakaotalk_mcp-0.3.0-py3-none-any.whl"
 ```
 
 ### 소스에서 설치
 
 ```bash
-git clone -b qt-uia https://github.com/Kwon-Sungeon/kakaotalk-mcp.git
+git clone https://github.com/Kwon-Sungeon/kakaotalk-mcp.git
 cd kakaotalk-mcp
 pip install -e .
 ```
@@ -88,7 +88,7 @@ Claude Desktop 개발자 설정에서 여는 `claude_desktop_config.json`의 `mc
   "mcpServers": {
     "kakao": {
       "command": "uvx",
-      "args": ["kakaotalk-mcp"]
+      "args": ["--from", "https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.3.0/kakaotalk_mcp-0.3.0-py3-none-any.whl", "kakaotalk-mcp"]
     }
   }
 }
@@ -127,7 +127,7 @@ Claude Desktop 개발자 설정에서 여는 `claude_desktop_config.json`의 `mc
 Claude Code 설정에서 MCP 서버 추가:
 
 ```bash
-claude mcp add kakao -- uvx kakaotalk-mcp
+claude mcp add kakao -- uvx --from https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.3.0/kakaotalk_mcp-0.3.0-py3-none-any.whl kakaotalk-mcp
 ```
 
 또는 `.claude/settings.json`에 직접 추가:
@@ -137,7 +137,7 @@ claude mcp add kakao -- uvx kakaotalk-mcp
   "mcpServers": {
     "kakao": {
       "command": "uvx",
-      "args": ["kakaotalk-mcp"]
+      "args": ["--from", "https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.3.0/kakaotalk_mcp-0.3.0-py3-none-any.whl", "kakaotalk-mcp"]
     }
   }
 }

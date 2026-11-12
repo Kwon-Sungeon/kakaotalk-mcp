@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-12
+
+- 하나의 설치 파일에 구형 Win32 및 신형 Qt UIA 백엔드를 포함합니다. 실행 중인 카카오톡에 맞춰 백엔드를 자동 선택하며 두 버전 모두 MCP 도구 13개를 제공합니다.
+- 최근 대화 조회와 모니터링에서 백그라운드 접근을 우선하고, 상세 조회에는 전체 복사를 사용할 수 있습니다.
+- 방과 입력 대상 확인을 강화하고, Codex와 Claude Desktop의 UI 조작을 한 번에 하나씩 실행합니다.
+
 ## [0.2.0] - 2026-03-22
 
 ### Added
@@ -61,3 +67,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 [0.2.0]: https://github.com/kronenz/kakaotalk-mcp/releases/tag/v0.2.0
 [0.1.0]: https://github.com/kronenz/kakaotalk-mcp/releases/tag/v0.1.0
+
+[0.3.0]: https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/tag/v0.3.0

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kakaotalk-mcp"
-version = "0.2.0"
-description = "MCP Server for KakaoTalk PC automation via Win32 API"
+version = "0.3.0"
+description = "MCP Server for KakaoTalk PC automation via Win32 and Qt UI Automation"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -23,9 +23,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/kronenz/kakaotalk-mcp"
-Repository = "https://github.com/kronenz/kakaotalk-mcp"
-Issues = "https://github.com/kronenz/kakaotalk-mcp/issues"
+Homepage = "https://github.com/Kwon-Sungeon/kakaotalk-mcp"
+Repository = "https://github.com/Kwon-Sungeon/kakaotalk-mcp"
+Issues = "https://github.com/Kwon-Sungeon/kakaotalk-mcp/issues"
 
 [project.scripts]
 kakaotalk-mcp = "kakao_mcp.server:main"
