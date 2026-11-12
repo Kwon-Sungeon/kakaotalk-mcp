@@ -92,3 +92,18 @@ $script:viewerOpen=$false
 $script:supportsInvoke=$true
 if((OpenPhoto 'photo' 'fixture').Current.Name -ne 'fixture'){throw 'Missing invoked viewer'}
 '3 isolated photo viewer scenarios passed'
+
+# No native window, file picker or button is used in these attachment tests.
+Add-Type -AssemblyName UIAutomationTypes
+$definition=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'FileEvidence'},$true)
+foreach($command in $definition.FindAll({param($n) $n -is [Management.Automation.Language.CommandAst]},$true)){
+ if($command.GetCommandName() -notin 'Children','Where-Object'){throw "Unmocked command: $command"}
+}
+. ([scriptblock]::Create($definition.Extent.Text))
+function Children($container){return $container}
+$label=@{Current=@{Name='fixture.pdf'}}
+$button=@{Current=@{Name='전송';ControlType=[System.Windows.Automation.ControlType]::Button;IsEnabled=$true}}
+if(-not (FileEvidence @($label,$button) 'fixture.pdf')){throw 'Expected exact matching attachment'}
+if(FileEvidence @($label,$button) 'other.pdf'){throw 'Accepted different file'}
+if(FileEvidence @($label,$button,$button) 'fixture.pdf'){throw 'Accepted ambiguous buttons'}
+'3 isolated file preview scenarios passed'

@@ -113,14 +113,15 @@ def test_send_message_success(mock_find, mock_child, mock_api):
     assert isinstance(controller.win32clipboard, Mock)
     from contextlib import ExitStack
     with ExitStack() as stack:
-        stack.enter_context(patch.object(controller, '_edit_text', side_effect=['', 'Hello', 'Hello']))
+        stack.enter_context(patch.object(controller, '_edit_text', side_effect=['', 'Hello', 'Hello', '']))
+        replace = stack.enter_context(patch.object(controller, '_replace_selection'))
         stack.enter_context(patch.object(controller, '_focus_control'))
         stack.enter_context(patch.object(controller, '_require_focus'))
         result = controller.send_message_to_room("TestRoom", "Hello")
     assert result["success"] is True
     assert "sent" in result["message"].lower()
     controller.win32clipboard.OpenClipboard.assert_not_called()
-    mock_api.SendMessage.assert_called_once_with(22222, controller.win32con.EM_REPLACESEL, 1, "Hello")
+    replace.assert_called_once_with(22222, "Hello")
 
 
 @patch("kakao_mcp.controller.find_chat_window")
@@ -305,6 +306,7 @@ def test_wrong_foreground_cannot_paste_or_send():
 def test_native_send_button_does_not_activate_window():
     with patch.object(controller, 'find_chat_window', return_value=11), \
             patch.object(controller, 'find_child_window_recursive', return_value=22), \
+            patch.object(controller, '_replace_selection'), \
             patch.object(controller, '_native_send_button', return_value=33), \
             patch.object(controller, '_edit_text', side_effect=['', 'sample', 'sample', '']), \
             patch.object(controller, 'bring_window_to_front') as activate:

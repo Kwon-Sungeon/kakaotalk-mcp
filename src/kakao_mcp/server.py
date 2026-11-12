@@ -1,38 +1,56 @@
 #!/usr/bin/env python
 """MCP Server for KakaoTalk PC automation via Windows UI Automation or Win32."""
 import os
+import time
+import sys
 from typing import Dict, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
 
 from kakao_mcp import backend as controller
 from kakao_mcp import parser
-from kakao_mcp import config
+from kakao_mcp import config, __version__
 
 ReadMode = Literal["auto", "background", "complete"]
 
 app = FastMCP(
     "kakao-mcp-server",
-    instructions="MCP Server for KakaoTalk PC automation via Windows UI Automation or Win32",
+    instructions=("Use kakao_open_room with the exact title for a closed room; list_open_rooms only lists "
+                  "open windows. Use kakao_send_file for documents and kakao_send_image for photos. "
+                  "If sending is unconfirmed, report the result; do not retry using computer use."),
 )
 
 
 @app.tool()
-def kakao_health_check() -> Dict:
-    """Check if KakaoTalk PC is currently running.
-    Returns status, window handle, and process ID."""
+def kakao_health_check(diagnostics: bool = False) -> Dict:
+    """Check KakaoTalk status and report the MCP version and detected backend.
+    diagnostics also probes read-only window discovery and reports its duration."""
+    from kakao_mcp import qt_controller, controller as legacy
+    report = {"mcp_version": __version__}
     try:
-        status = controller.is_kakaotalk_running()
-        if status["running"]:
-            return {
-                "message": "KakaoTalk is running",
-                "running": True,
-                "hwnd": status["hwnd"],
-                "pid": status["pid"],
-            }
-        return {"message": "KakaoTalk is not running", "running": False}
-    except Exception as e:
-        return {"error": f"Health check failed: {e}"}
+        impl = qt_controller if qt_controller.available() else legacy
+        status = impl.is_kakaotalk_running()
+        running = status["running"]
+        report.update(status, backend=("qt_uia" if impl is qt_controller else "win32") if running else None,
+                      message="KakaoTalk is running" if running else "KakaoTalk is not running")
+        if diagnostics:
+            report["windows_build"] = sys.getwindowsversion().build
+            report["python"] = sys.version.split()[0]
+            if running:
+                import win32api, win32process
+                handle = win32api.OpenProcess(0x1000, False, status["pid"])
+                try:
+                    version = win32api.GetFileVersionInfo(win32process.GetModuleFileNameEx(handle, 0), "\\")
+                    ms, ls = version["FileVersionMS"], version["FileVersionLS"]
+                    report["kakaotalk_version"] = f"{ms >> 16}.{ms & 65535}.{ls >> 16}.{ls & 65535}"
+                finally:
+                    handle.Close()
+                start = time.perf_counter()
+                report["open_room_count"] = len(impl.list_chat_windows())
+                report["discovery_ms"] = round((time.perf_counter() - start) * 1000)
+        return report
+    except Exception as error:
+        return {**report, "error": f"Health check failed: {error}"}
 
 
 @app.tool()
@@ -119,6 +137,14 @@ def kakao_send_bulk(room_names: list[str], message: str, interval_sec: float = 0
         return {"error": result.get("error") or result.get("message", "Failed to send bulk messages"), "results": result.get("results", [])}
     except Exception as e:
         return {"error": f"Failed to send bulk messages: {e}"}
+
+
+@app.tool()
+def kakao_send_file(room_name: str, file_paths: list[str]) -> Dict:
+    """Attach documents or other local files through an open room's file picker.
+    Use absolute paths. Results identify completed items; never retry an uncertain send automatically."""
+    from .attachments import send_files
+    return send_files(room_name, file_paths)
 
 
 @app.tool()
@@ -338,6 +364,13 @@ def kakao_get_monitor_events() -> Dict:
 
 
 def main():
+    if sys.argv[1:] == ["--diagnose"]:
+        import json
+        report = kakao_health_check(diagnostics=True)
+        print(json.dumps(report, indent=2, ensure_ascii=True))
+        if not report.get("running") or "error" in report:
+            raise SystemExit(1)
+        return
     app.run(transport="stdio")
 
 

@@ -1,46 +1,63 @@
 """Qt KakaoTalk backend using Windows UI Automation and scoped keyboard input."""
-import json
 import os
 from pathlib import Path
 import subprocess
 import time
 
+import win32api
 import win32gui
+import win32process
 
 from . import controller as legacy
 from .ui_lock import operation
+from .qt_bridge import bridge
+
+
+def _qt_windows():
+    """Identify this desktop's KakaoTalk by executable, including a hidden main window."""
+    windows = []
+    executables = {}
+
+    def visit(hwnd, _):
+        try:
+            if not win32gui.GetClassName(hwnd).startswith('Qt'):
+                return
+            pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+            if pid not in executables:
+                handle = win32api.OpenProcess(0x1000, False, pid)
+                try:
+                    executables[pid] = Path(win32process.GetModuleFileNameEx(handle, 0)).name.lower()
+                finally:
+                    handle.Close()
+            if executables[pid] in {'kakaotalkui.exe', 'kakaotalk.exe'}:
+                windows.append((pid, hwnd, win32gui.GetWindowText(hwnd)))
+        except win32gui.error:
+            # Unrelated protected processes and disappearing windows are normal.
+            return
+
+    win32gui.EnumWindows(visit, None)
+    return windows
+
 
 def call(action, **arguments):
-    script = Path(__file__).with_name('qt_uia.ps1').read_text(encoding='utf-8')
     with operation():
-        # Windows PowerShell 5.1 reads BOM-less scripts in the system code page
-        # with -File. Supply the Unicode script and send request data on stdin.
-        command = "[Console]::InputEncoding=[Console]::OutputEncoding=[Text.UTF8Encoding]::new(); " + script
+        pids = {pid for pid, _, _ in _qt_windows()}
+        if len(pids) != 1:
+            raise RuntimeError(f'Expected one accessible Qt KakaoTalk process on this desktop, found {len(pids)}')
         timeout = max(45, 15 * arguments.get('limit', 1)) if action == 'download' else 45
-        result = subprocess.run(
-            ['powershell.exe', '-NoProfile', '-Sta', '-NonInteractive', '-Command', command],
-            input=json.dumps({'action': action, **arguments}, ensure_ascii=False),
-            capture_output=True, encoding='utf-8', timeout=timeout,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
-        if result.returncode:
-            raise RuntimeError(result.stderr.strip())
-        response = json.loads(result.stdout)
-        if not response['success']:
-            raise RuntimeError(response['error'])
-        return response['data']
+        return bridge.request({'action': action, 'process_id': pids.pop(), **arguments}, timeout)
 
 
 def available():
-    found = []
-    def visit(hwnd, _):
-        if win32gui.GetWindowText(hwnd) == '카카오톡' and win32gui.GetClassName(hwnd).startswith('Qt'):
-            found.append(hwnd)
-    win32gui.EnumWindows(visit, None)
-    return bool(found)
+    return bool(_qt_windows())
 
 
 def is_kakaotalk_running():
+    windows = _qt_windows()
+    main = [(pid, hwnd) for pid, hwnd, title in windows if title in {'카카오톡', 'KakaoTalk'}]
+    if len(main) == 1 and len({pid for pid, _, _ in windows}) == 1:
+        pid, hwnd = main[0]
+        return {'running': True, 'pid': pid, 'hwnd': hwnd}
     return call('health')
 
 

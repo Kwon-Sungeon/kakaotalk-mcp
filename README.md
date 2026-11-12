@@ -24,6 +24,7 @@ Codex, Claude Desktop, Claude Code 등 MCP 클라이언트에서 카카오톡 �
 | `kakao_send_mention` | @멘션과 함께 메시지 전송 |
 | `kakao_read_messages` | 채팅방 메시지 읽기 |
 | `kakao_extract_links` | 채팅방에서 공유된 URL 추출 |
+| `kakao_send_file` | PDF·문서 등 일반 파일 첨부 (절대 경로) |
 | `kakao_send_image` | 채팅방에 이미지 파일 전송 |
 | `kakao_download_images` | 채팅 사진 저장 (구형은 계정 캐시에서 복사) |
 
@@ -43,20 +44,20 @@ Codex, Claude Desktop, Claude Code 등 MCP 클라이언트에서 카카오톡 �
 
 ## 설치
 
-v0.3.0은 구형 Win32와 신형 Qt 카카오톡을 함께 지원합니다. 아래 명령은 GitHub Release의 공통 패키지를 사용합니다.
+v0.4.0은 구형 Win32와 신형 Qt 카카오톡을 함께 지원합니다. 아래 명령은 GitHub Release의 공통 패키지를 사용합니다.
 
 ### uvx
 
 별도 설치 없이 바로 실행:
 
 ```bash
-uvx --from https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.3.0/kakaotalk_mcp-0.3.0-py3-none-any.whl kakaotalk-mcp
+uvx --from https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.4.0/kakaotalk_mcp-0.4.0-py3-none-any.whl kakaotalk-mcp
 ```
 
 ### pip
 
 ```bash
-python -m pip install "https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.3.0/kakaotalk_mcp-0.3.0-py3-none-any.whl"
+python -m pip install "https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.4.0/kakaotalk_mcp-0.4.0-py3-none-any.whl"
 ```
 
 ### 소스에서 설치
@@ -64,14 +65,25 @@ python -m pip install "https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/do
 ```bash
 git clone https://github.com/Kwon-Sungeon/kakaotalk-mcp.git
 cd kakaotalk-mcp
-pip install -e .
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
 ```
 
 ## 설정
 
 ### Codex
 
-소스 설치에 사용한 가상 환경의 절대 경로를 등록합니다.
+기존에 등록한 v0.3.0 URL은 자동 업데이트되지 않습니다. uv가 설치된 PC에서는 PowerShell에서 아래 명령으로 등록한 뒤 Codex를 다시 열고 새 대화에서 확인하세요.
+
+```powershell
+$wheel = 'https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.4.0/kakaotalk_mcp-0.4.0-py3-none-any.whl'
+codex mcp add kakao -- uvx --from $wheel kakaotalk-mcp
+uvx --from $wheel kakaotalk-mcp --diagnose
+```
+
+진단 명령은 카카오톡 버전, 선택된 백엔드(`win32` 또는 `qt_uia`), 열린 방 수, 조회 시간을 출력합니다. 방 이름과 대화 내용은 출력하지 않으며 전송하지 않습니다. 새 대화에서 `kakao_health_check(diagnostics=true)`가 0.4.0을 보고하는지 확인하세요. 도구 자체가 없으면 카카오톡 UI 문제가 아니라 MCP 등록/연결 문제부터 확인합니다.
+
+소스 설치에서는 위 uvx 명령 대신 가상 환경의 절대 경로를 등록합니다.
 
 ```powershell
 codex mcp add kakao -- 'C:\경로\kakaotalk-mcp\.venv\Scripts\python.exe' -m kakao_mcp
@@ -88,7 +100,7 @@ Claude Desktop 개발자 설정에서 여는 `claude_desktop_config.json`의 `mc
   "mcpServers": {
     "kakao": {
       "command": "uvx",
-      "args": ["--from", "https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.3.0/kakaotalk_mcp-0.3.0-py3-none-any.whl", "kakaotalk-mcp"]
+      "args": ["--from", "https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.4.0/kakaotalk_mcp-0.4.0-py3-none-any.whl", "kakaotalk-mcp"]
     }
   }
 }
@@ -127,7 +139,7 @@ Claude Desktop 개발자 설정에서 여는 `claude_desktop_config.json`의 `mc
 Claude Code 설정에서 MCP 서버 추가:
 
 ```bash
-claude mcp add kakao -- uvx --from https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.3.0/kakaotalk_mcp-0.3.0-py3-none-any.whl kakaotalk-mcp
+claude mcp add kakao -- uvx --from https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.4.0/kakaotalk_mcp-0.4.0-py3-none-any.whl kakaotalk-mcp
 ```
 
 또는 `.claude/settings.json`에 직접 추가:
@@ -137,7 +149,7 @@ claude mcp add kakao -- uvx --from https://github.com/Kwon-Sungeon/kakaotalk-mcp
   "mcpServers": {
     "kakao": {
       "command": "uvx",
-      "args": ["--from", "https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.3.0/kakaotalk_mcp-0.3.0-py3-none-any.whl", "kakaotalk-mcp"]
+      "args": ["--from", "https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.4.0/kakaotalk_mcp-0.4.0-py3-none-any.whl", "kakaotalk-mcp"]
     }
   }
 }
@@ -163,6 +175,9 @@ Claude에게 자연어로 요청하면 됩니다:
 ## 제한사항 및 주의사항
 
 - **Windows 전용**: Win32 API를 사용하므로 macOS/Linux에서는 동작하지 않습니다.
+- 방 목록은 **열린 창만** 반환합니다. 닫힌 방은 정확한 방 이름으로 `kakao_open_room`을 먼저 호출하세요. 구형 검색이 채팅 탭을 확인하지 못하면 직접 채팅 탭을 선택하세요.
+- 일반 파일은 `kakao_send_file`에 절대 경로 목록을 전달합니다. 파일 선택에 성공해도 카카오톡의 후속 확인 화면을 식별하지 못하면 미확인으로 중단합니다. 이때 같은 파일을 다시 보내기 전 해당 방을 확인하세요.
+- 구형에서 전송 키 설정이 Ctrl+Enter라면 MCP 서버 환경 변수 `KAKAO_LEGACY_SEND_KEY=ctrl_enter`를 지정하세요. 작성란이 비워지지 않으면 성공 처리하지 않습니다.
 - Qt 일반 텍스트 전송은 해당 방의 UIA 입력란과 전송 버튼을 사용합니다. 기존 초안이 있거나 본문이 달라지면 중단합니다.
 - 이미 열린 방을 `kakao_open_room`으로 지정하면 작업 중인 창을 유지합니다. 방을 화면 앞으로 가져오려면 `focus=true`를 지정합니다. Qt에서 닫힌 방 검색과 사진 열기는 UIA 호출을 먼저 시도하고, 대상 창이 열리지 않을 때 클릭합니다.
 - 최근 대화 조회 시 기본 `auto` 모드는 Qt에서 UIA에 노출된 대화를 먼저 읽습니다. 개수를 생략하면 최대 50개를 반환하며, 현재 노출 범위는 로드된 전체 대화보다 짧을 수 있습니다. 개수를 지정하면 최신 위치·개수·발신자·날짜가 확인될 때만 이 경로를 사용하고 부족하면 대화를 복사합니다. 전체 링크 추출도 기본적으로 로드된 대화를 복사합니다.
@@ -205,7 +220,7 @@ kakaotalk-mcp/
 │   └── kakao_mcp/
 │       ├── __init__.py
 │       ├── __main__.py      # python -m kakao_mcp 지원
-│       ├── server.py        # MCP 서버 + 13개 도구 정의
+│       ├── server.py        # MCP 서버 + 14개 도구 정의
 │       ├── backend.py       # 실행 중인 UI에 맞는 백엔드 선택
 │       ├── qt_controller.py # Qt 작업 직렬화 및 UIA 호출
 │       ├── qt_uia.ps1       # Windows UI Automation

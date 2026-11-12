@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import ctypes
+import re
 from contextlib import contextmanager
 from ctypes import wintypes
 import shutil
@@ -30,15 +31,27 @@ def _log(msg: str):
 # Window discovery
 # ---------------------------------------------------------------------------
 
+def _main_window():
+    return (win32gui.FindWindow(config.KAKAO_MAIN_WINDOW_CLASS, config.KAKAO_MAIN_WINDOW_TITLE)
+            or win32gui.FindWindow(config.KAKAO_MAIN_WINDOW_CLASS, 'KakaoTalk'))
+
+
+def _wait_until(check, seconds):
+    deadline = time.monotonic() + seconds
+    while True:
+        value = check()
+        if value or time.monotonic() >= deadline:
+            return value
+        time.sleep(.06)
+
+
 def is_kakaotalk_running() -> Dict:
     """Check if KakaoTalk main window exists.
 
     Returns:
         Dict with running (bool), hwnd (int|None), pid (int|None).
     """
-    hwnd = win32gui.FindWindow(
-        config.KAKAO_MAIN_WINDOW_CLASS, config.KAKAO_MAIN_WINDOW_TITLE
-    )
+    hwnd = _main_window()
     if hwnd == 0:
         return {"running": False, "hwnd": None, "pid": None}
     _, pid = win32process.GetWindowThreadProcessId(hwnd)
@@ -50,13 +63,18 @@ def find_chat_window(room_name: str) -> Optional[int]:
 
     Returns hwnd or None.
     """
+    main = _main_window()
+    if not main:
+        return None
+    pid = win32process.GetWindowThreadProcessId(main)[1]
     results: List[int] = []
 
     def _cb(hwnd, _):
         if win32gui.IsWindowVisible(hwnd):
             cls = win32gui.GetClassName(hwnd)
             title = win32gui.GetWindowText(hwnd)
-            if cls == config.KAKAO_CHAT_WINDOW_CLASS and title == room_name:
+            if (hwnd != main and cls == config.KAKAO_CHAT_WINDOW_CLASS and title == room_name
+                    and win32process.GetWindowThreadProcessId(hwnd)[1] == pid):
                 results.append(hwnd)
         return True
 
@@ -71,9 +89,7 @@ def list_chat_windows() -> List[Dict]:
 
     Returns list of dicts with hwnd and title.
     """
-    main_hwnd = win32gui.FindWindow(
-        config.KAKAO_MAIN_WINDOW_CLASS, config.KAKAO_MAIN_WINDOW_TITLE
-    )
+    main_hwnd = _main_window()
     windows: List[Dict] = []
 
     def _cb(hwnd, _):
@@ -180,6 +196,12 @@ def _require_focus(window, control):
         raise RuntimeError("KakaoTalk target lost keyboard focus")
 
 
+def _replace_selection(control, text):
+    value = ctypes.create_unicode_buffer(text)
+    win32gui.SendMessageTimeout(control, win32con.EM_REPLACESEL, 1, ctypes.addressof(value),
+                                win32con.SMTO_ABORTIFHUNG, 1500)
+
+
 def _edit_text(control):
     _, length = win32gui.SendMessageTimeout(control, win32con.WM_GETTEXTLENGTH, 0, 0, win32con.SMTO_ABORTIFHUNG, 1000)
     buffer = ctypes.create_unicode_buffer(length + 1)
@@ -207,16 +229,18 @@ def _click_control(window, control):
     _require_focus(window, control)
 
 
-def _native_send_button(window):
+def _native_send_button(window, *, custom=False):
     """A standard, enabled send button can receive BM_CLICK without global input."""
     if not win32gui.IsWindowEnabled(window):
         return None
     buttons = []
 
     def visit(control, _):
-        if (win32gui.GetClassName(control) == 'Button'
+        cls = win32gui.GetClassName(control).lower()
+        if ((cls.startswith('eva_button') if custom else cls == 'button')
                 and win32gui.GetAncestor(control, win32con.GA_ROOT) == window
-                and win32gui.GetWindowText(control).strip() in {'전송', '보내기'}
+                and re.fullmatch(r'(전송|보내기|send)(?:\s*\([a-z]\))?',
+                                 win32gui.GetWindowText(control).replace('&', '').strip(), re.I)
                 and win32gui.IsWindowVisible(control) and win32gui.IsWindowEnabled(control)):
             buttons.append(control)
         return True
@@ -363,7 +387,7 @@ def send_message_to_room(room_name: str, text: str) -> Dict:
 
     expected = text.replace('\r\n', '\n').replace('\r', '\n')
     # EM_REPLACESEL goes to this Rich Edit and updates its change listeners.
-    win32api.SendMessage(edit_hwnd, win32con.EM_REPLACESEL, 1, expected.replace('\n', '\r\n'))
+    _replace_selection(edit_hwnd, expected.replace('\n', '\r\n'))
     draft = _edit_text(edit_hwnd)
     if not draft:
         win32clipboard.OpenClipboard()
@@ -372,33 +396,51 @@ def send_message_to_room(room_name: str, text: str) -> Dict:
             win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
         finally:
             win32clipboard.CloseClipboard()
-        win32api.SendMessage(edit_hwnd, win32con.WM_PASTE, 0, 0)
+        win32gui.SendMessageTimeout(edit_hwnd, win32con.WM_PASTE, 0, 0, win32con.SMTO_ABORTIFHUNG, 1500)
         draft = _edit_text(edit_hwnd)
     if draft != expected:
         return {"success": False, "error": "Chat draft changed before send"}
 
     button = _native_send_button(hwnd)
     if button:
-        if _edit_text(edit_hwnd) != expected:
+        if find_chat_window(room_name) != hwnd or _edit_text(edit_hwnd) != expected:
             return {"success": False, "error": "Chat draft changed before send"}
         win32gui.SendMessageTimeout(button, win32con.BM_CLICK, 0, 0, win32con.SMTO_ABORTIFHUNG, 1000)
-        deadline = time.monotonic() + 1
-        while _edit_text(edit_hwnd):
-            if time.monotonic() >= deadline:
-                return {"success": False, "error": "Send outcome uncertain; do not retry automatically"}
-            time.sleep(0.05)
-        return {"success": True, "message": f"Message sent to '{room_name}'"}
+        return _sent_when_cleared(edit_hwnd, room_name)
+
+    custom_button = _native_send_button(hwnd, custom=True)
+    if custom_button:
+        # Owner-drawn EVA buttons may not implement BM_CLICK. Deliver the mouse
+        # messages to this button HWND only; never move the desktop pointer.
+        _, _, width, height = win32gui.GetClientRect(custom_button)
+        if (not width or not height or find_chat_window(room_name) != hwnd
+                or _edit_text(edit_hwnd) != expected):
+            return {"success": False, "error": "Target or draft changed before send"}
+        point = ((height // 2) << 16) | (width // 2)
+        for msg, keys in [(win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON), (win32con.WM_LBUTTONUP, 0)]:
+            win32gui.SendMessageTimeout(custom_button, msg, keys, point, win32con.SMTO_ABORTIFHUNG, 1000)
+        return _sent_when_cleared(edit_hwnd, room_name)
 
     bring_window_to_front(hwnd)
     _focus_control(hwnd, edit_hwnd)
     if _edit_text(edit_hwnd) != expected:
         return {"success": False, "error": "Chat draft changed before send"}
+    if find_chat_window(room_name) != hwnd:
+        return {"success": False, "error": "Target room changed before send"}
     _require_focus(hwnd, edit_hwnd)
-    # Press Enter using keybd_event (not WM_KEYDOWN — WM_KEYDOWN inserts newline in RICHEDIT)
-    _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
-    _user32.keybd_event(config.VK_RETURN, 0, config.KEYEVENTF_KEYUP, 0)
+    send_key = os.environ.get('KAKAO_LEGACY_SEND_KEY', 'enter').lower()
+    if send_key == 'ctrl_enter':
+        _send_ctrl_key_combo(config.VK_RETURN)
+    else:
+        _press_key(config.VK_RETURN)
+    return _sent_when_cleared(edit_hwnd, room_name)
 
-    return {"success": True, "message": f"Message sent to '{room_name}'"}
+
+def _sent_when_cleared(edit, room):
+    if _wait_until(lambda: _edit_text(edit) == '', 2):
+        return {"success": True, "message": f"Message sent to '{room}'"}
+    return {"success": False, "error": "Send not confirmed: the draft did not clear. Check the room; "
+            "do not retry automatically. If KakaoTalk uses Ctrl+Enter set KAKAO_LEGACY_SEND_KEY=ctrl_enter."}
 
 
 # ---------------------------------------------------------------------------
@@ -772,23 +814,38 @@ def _activate_search_and_get_edit(main_hwnd: int) -> Optional[int]:
     KakaoTalk PC uses Ctrl+F to open the search bar in the chat list view.
     After Ctrl+F, the Edit control becomes visible and focused.
     """
-    chat_list_view = _find_chat_list_view(main_hwnd)
-    _log(f"ChatRoomListView hwnd: {chat_list_view}")
-    if chat_list_view is None:
-        return None
+    def active_view():
+        view = _find_chat_list_view(main_hwnd)
+        return view if view and win32gui.IsWindowVisible(view) else None
 
-    # Press Ctrl+F to activate search
-    _send_ctrl_key_combo(0x46)  # 0x46 = 'F'
-    time.sleep(config.SEARCH_ACTIVATE_WAIT_SEC)
+    view = active_view()
+    for _ in range(3):
+        if view:
+            break
+        if _user32.GetForegroundWindow() != main_hwnd:
+            raise RuntimeError("Main window lost focus before selecting Chats")
+        _send_ctrl_key_combo(win32con.VK_TAB)
+        view = _wait_until(active_view, .45)
+    if not view:
+        raise RuntimeError("Chats tab not accessible. Select the Chats tab in KakaoTalk, then open the room.")
 
-    # Find the Edit control — should now be visible and focused
-    edit_hwnd = find_child_window_recursive(chat_list_view, "Edit")
-    if edit_hwnd:
-        vis = win32gui.IsWindowVisible(edit_hwnd)
-        _log(f"Edit hwnd after Ctrl+F: {edit_hwnd}, visible: {vis}")
-    else:
-        _log("Edit not found after Ctrl+F")
-    return edit_hwnd
+    def visible_edit():
+        edits = []
+        def visit(child, _):
+            if (win32gui.GetClassName(child).lower() == 'edit' and win32gui.IsWindowVisible(child)
+                    and win32gui.IsWindowEnabled(child)):
+                edits.append(child)
+            return True
+        win32gui.EnumChildWindows(view, visit, None)
+        return edits[0] if len(edits) == 1 else None
+
+    edit = visible_edit()
+    if not edit and _user32.GetForegroundWindow() == main_hwnd:
+        _send_ctrl_key_combo(ord('F'))
+        edit = _wait_until(visible_edit, 2.5)
+    if edit:
+        _focus_control(main_hwnd, edit)
+    return edit
 
 
 def _ensure_foreground(hwnd: int) -> bool:
@@ -803,15 +860,12 @@ def _ensure_foreground(hwnd: int) -> bool:
 def search_and_open_room(room_name: str) -> Dict:
     """Search for a chat room in KakaoTalk main window and open it.
 
-    Uses clipboard paste into the search Edit box (for Korean IME support),
-    then double-clicks the first search result in SearchListCtrl.
+    Selects Chats, searches through its visible Edit, and verifies the exact opened room.
 
     Returns:
         Dict with success (bool) and message or error.
     """
-    main_hwnd = win32gui.FindWindow(
-        config.KAKAO_MAIN_WINDOW_CLASS, config.KAKAO_MAIN_WINDOW_TITLE
-    )
+    main_hwnd = _main_window()
     if main_hwnd == 0:
         return {"success": False, "error": "KakaoTalk main window not found"}
 
@@ -824,36 +878,19 @@ def search_and_open_room(room_name: str) -> Dict:
     if edit_hwnd is None:
         return {"success": False, "error": "Search box not found in KakaoTalk main window"}
 
-    # Clear any existing text in the Edit using EM_SETSEL + WM_CLEAR
-    EM_SETSEL = 0x00B1
-    WM_CLEAR = 0x0303
-    win32api.SendMessage(edit_hwnd, EM_SETSEL, 0, -1)  # Select all
-    win32api.SendMessage(edit_hwnd, WM_CLEAR, 0, 0)     # Delete selected
-    time.sleep(config.EDIT_CLICK_WAIT_SEC)
-
-    # Type search text character by character using WM_CHAR
-    # This goes directly to the Edit control — no focus or clipboard needed
-    for ch in room_name:
-        win32api.SendMessage(edit_hwnd, config.WM_CHAR, ord(ch), 0)
-        time.sleep(config.SEARCH_CHAR_INTERVAL_SEC)
-    _log(f"Typed '{room_name}' into Edit via WM_CHAR")
-    time.sleep(config.SEARCH_RESULTS_WAIT_SEC)  # Wait for search results to populate
-
-    # Press Enter to open the first search result (already selected by default)
+    win32gui.SendMessageTimeout(edit_hwnd, win32con.EM_SETSEL, 0, -1, win32con.SMTO_ABORTIFHUNG, 1500)
+    _replace_selection(edit_hwnd, room_name)
+    if _edit_text(edit_hwnd) != room_name:
+        return {"success": False, "error": "Could not verify exact room search text"}
+    # A custom list can keep showing the previous query while it refreshes.
+    time.sleep(config.SEARCH_RESULTS_WAIT_SEC)
     _require_focus(main_hwnd, edit_hwnd)
-    _log("Pressing Enter to open first search result")
-    _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
-    _user32.keybd_event(config.VK_RETURN, 0, config.KEYEVENTF_KEYUP, 0)
-    time.sleep(config.SEARCH_OPEN_WAIT_SEC)
-
-    # Do NOT press Escape here — it would close the newly opened chat window
-
-    # Look for opened chat windows
-    all_windows = list_chat_windows()
-    _log(f"Open windows after search: {[w['title'] for w in all_windows]}")
-    for w in all_windows:
-        if w["title"] == room_name:
-            return {"success": True, "message": f"Opened chat room '{room_name}'", "hwnd": w["hwnd"]}
+    if _edit_text(edit_hwnd) != room_name:
+        return {"success": False, "error": "Search text changed"}
+    _press_key(config.VK_RETURN)
+    hwnd = _wait_until(lambda: find_chat_window(room_name), 3)
+    if hwnd:
+        return {"success": True, "message": f"Opened chat room '{room_name}'", "hwnd": hwnd}
     return {
         "success": False,
         "error": f"Chat room '{room_name}' not found after search. "

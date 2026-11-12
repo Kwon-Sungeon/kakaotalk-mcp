@@ -2,7 +2,9 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 Add-Type -AssemblyName WindowsBase
-Add-Type @'
+function InitializeInput {
+ if('KakaoInput' -as [type]){return}
+ Add-Type @'
 using System;
 using System.Runtime.InteropServices;
 public class KakaoInput {
@@ -21,6 +23,12 @@ public class KakaoInput {
   try { return SendMessageTimeoutW(hwnd,0xC2,new IntPtr(1),value,2,500,out result)!=IntPtr.Zero; }
   finally { Marshal.FreeHGlobal(value); }
  }
+ [DllImport("user32.dll",CharSet=CharSet.Unicode)] private static extern IntPtr SendMessageTimeoutW(IntPtr h,uint m,IntPtr w,System.Text.StringBuilder l,uint f,uint t,out IntPtr result);
+ public static bool FilenameEquals(IntPtr h,string path){
+  var value=new System.Text.StringBuilder(path.Length+2); IntPtr result;
+  return SendMessageTimeoutW(h,0x0D,new IntPtr(value.Capacity),value,2,500,out result)!=IntPtr.Zero && value.ToString()==path;
+ }
+ [DllImport("user32.dll",CharSet=CharSet.Unicode)] public static extern bool PostMessageW(IntPtr h,uint m,IntPtr w,IntPtr l);
  public static bool CursorAt(int x,int y){Point p; return GetCursorPos(out p) && p.X == x && p.Y == y;}
  [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
  [DllImport("user32.dll")] private static extern IntPtr GetClipboardOwner();
@@ -31,13 +39,14 @@ public class KakaoInput {
  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int n);
  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+ [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h,uint cmd);
+ [DllImport("user32.dll")] public static extern IntPtr GetLastActivePopup(IntPtr h);
  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y);
  [DllImport("user32.dll")] public static extern void mouse_event(uint f,int x,int y,int d,UIntPtr e);
 }
 '@
-[void][KakaoInput]::SetProcessDPIAware()
-$request = [Console]::In.ReadToEnd() | ConvertFrom-Json
-$script:process = Get-Process KakaoTalkUI -ErrorAction SilentlyContinue | Select-Object -First 1
+ [void][KakaoInput]::SetProcessDPIAware()
+}
 function Children($element) {
  for($attempt=0;$attempt -lt 3;$attempt++){
   try {return @($element.FindAll([System.Windows.Automation.TreeScope]::Descendants,[System.Windows.Automation.Condition]::TrueCondition))}
@@ -45,7 +54,8 @@ function Children($element) {
  }
 }
 function Windows {
- @([System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children,[System.Windows.Automation.Condition]::TrueCondition) | Where-Object {$_.Current.ProcessId -eq $script:process.Id})
+ $condition=[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ProcessIdProperty,[int]$request.process_id)
+ @([System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children,$condition))
 }
 function Main {
  $w = @(Windows | Where-Object {$_.Current.ClassName -like 'MainWindow*'})
@@ -197,13 +207,121 @@ function SendButton($container) {
 function AssertDraft($inputElement, [string]$expected) {
  if((Value $inputElement).Current.Value -cne $expected){throw 'Chat draft changed'}
 }
+function FileRoom {
+ $w=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$request.hwnd)
+ if($w.Current.ProcessId -ne $request.process_id -or $w.Current.Name -cne $request.room){throw 'File target room changed'}
+ if($request.qt){return (Room $request.room)}
+ if($w.Current.ClassName -ne 'EVA_Window_Dblclk'){throw 'Unexpected legacy chat window'}
+ $script:roomHwnd=$request.hwnd
+ return $w
+}
+function OwnedPopup {
+ foreach($h in @([KakaoInput]::GetLastActivePopup([IntPtr]$request.hwnd),[KakaoInput]::GetForegroundWindow())){
+  if($h -eq [IntPtr]::Zero -or $h -eq [IntPtr]$request.hwnd){continue}
+  $owner=$h
+  for($level=0;$level -lt 5;$level++){
+   $owner=[KakaoInput]::GetWindow($owner,4)
+   if($owner -eq [IntPtr]::Zero){break}
+   if($owner -eq [IntPtr]$request.hwnd){
+    $el=[System.Windows.Automation.AutomationElement]::FromHandle($h)
+    if($el.Current.ProcessId -eq $request.process_id){return $el}
+    break
+   }
+  }
+ }
+}
+function FilePick($w) {
+ if((OwnedPopup) -or -not $w.Current.IsEnabled){throw 'Close the existing room dialog before attaching'}
+ if($request.qt){
+  AssertDraft (InputBox $w) ''
+  $buttons=@(Children $w | Where-Object {$_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and $_.Current.Name -in '파일 전송','Send file','Send files'})
+  if($buttons.Count -ne 1){throw 'Unique file attachment button not found'}
+  $invoke=$null
+  if($buttons[0].TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$invoke)){$invoke.Invoke()}
+  else{Front $w; Click $buttons[0]}
+ }else{
+  Front $w
+  if((OwnedPopup) -or -not (FileRoom).Current.IsEnabled){throw 'Legacy room has an open dialog'}
+  Ctrl 84
+ }
+ SelectFilePath
+}
+function SelectFilePath {
+ $picker=WaitFor {OwnedPopup | Where-Object {$_.Current.ClassName -eq '#32770'}} 3500
+ if(-not $picker){throw 'Room-owned Windows file picker did not open; no file selected'}
+ $controls=@(Children $picker)
+ $combos=@($controls | Where-Object {$_.Current.AutomationId -in '1148','FileNameControlHost'})
+ $edits=@(if($combos.Count -eq 1){if($combos[0].Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit){$combos[0]}else{Children $combos[0] | Where-Object {$_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit}}})
+ if($edits.Count -eq 0){$edits=@($controls | Where-Object {$_.Current.AutomationId -in '1001','1148' -and $_.Current.ClassName -eq 'Edit'})}
+ $ok=@($controls | Where-Object {$_.Current.AutomationId -eq '1' -and ($_.Current.ClassName -eq 'Button' -or $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button) -and $_.Current.Name.Replace('&','') -match '^(열기|Open)(\([A-Za-z]\))?$'})
+ if($ok.Count -ne 1 -or $edits.Count -ne 1){throw 'Cannot verify the file name field and Open button'}
+ $editHwnd=[IntPtr]$edits[0].Current.NativeWindowHandle
+ if($edits[0].Current.ClassName -eq 'Edit' -and [KakaoInput]::ReplaceFilename($editHwnd,$request.path)){
+  $matchesPath=[KakaoInput]::FilenameEquals($editHwnd,$request.path)
+ }else{
+  $val=Value $edits[0]
+  $val.SetValue($request.path)
+  $matchesPath=$val.Current.Value -ceq $request.path
+ }
+ if(-not $matchesPath -or (OwnedPopup).Current.NativeWindowHandle -ne $picker.Current.NativeWindowHandle){throw 'File picker or selected path changed'}
+ $null=FileRoom
+ if($ok[0].Current.ClassName -eq 'Button' -and $ok[0].Current.NativeWindowHandle){
+  if(-not [KakaoInput]::PostMessageW([IntPtr]$ok[0].Current.NativeWindowHandle,0xF5,[IntPtr]::Zero,[IntPtr]::Zero)){throw 'Could not submit selected file'}
+ }else{Invoke $ok[0]}
+}
+function FileEvidence($container, $name) {
+ $els=@(Children $container)
+ $exact=@($els | Where-Object {$_.Current.Name -ceq $name})
+ if(-not $exact.Count){return}
+ $send=@($els | Where-Object {$_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and $_.Current.IsEnabled -and $_.Current.Name.Replace('&','') -match '^(전송|보내기|Send)(\([A-Za-z]\))?$'})
+ if($send.Count -eq 1){return $send[0]}
+}
+function FilePreview {
+ $popup=OwnedPopup
+ if($popup){return $popup}
+ $w=FileRoom
+ if($request.qt){
+  $panels=@(Children $w | Where-Object {$_.Current.ClassName -match '(File.*(Window|Dialog)|(Window|Dialog).*File)' -and -not $_.Current.IsOffscreen})
+  if($panels.Count -eq 1){return $panels[0]}
+ }
+}
+function SendFile {
+ $w=FileRoom
+ if(FilePreview){throw 'Close the existing file preview before attaching'}
+ $name=[IO.Path]::GetFileName($request.path)
+ $before=0
+ $bubbles={
+  $w=FileRoom
+  @(Children $w | Where-Object {$_.Current.ClassName -like 'ChatLogContentFile*'} | Where-Object {
+    @(Children $_ | Where-Object {$_.Current.Name -ceq $name}).Count -gt 0
+  }).Count
+ }
+ if($request.qt){$before=& $bubbles}
+ FilePick $w
+ $clicked=$false
+ $deadline=[DateTime]::UtcNow.AddSeconds(6)
+ do {
+  if($request.qt -and (& $bubbles) -gt $before){return @{sent=$true;confirmation='room_bubble'}}
+  $preview=FilePreview
+  if($preview -and -not $clicked){
+   $button=FileEvidence $preview $name
+   if($button){
+    $null=FileRoom
+    Invoke $button
+    $clicked=$true
+   }
+  }elseif($clicked -and -not $preview){return @{sent=$true;confirmation='preview_closed'}}
+  Start-Sleep -Milliseconds 120
+ }while([DateTime]::UtcNow -lt $deadline)
+ throw 'File submitted to the picker, but sending could not be confirmed. Inspect the room; do not retry automatically.'
+}
 function ChatTab($w){
  $tab=Children $w | Where-Object {$_.Current.Name -eq '채팅' -and $_.Current.ClassName -like 'TabMenuButton*'} | Select-Object -First 1
  Invoke $tab
  Start-Sleep -Milliseconds 250
 }
 function Snapshot($w){
- @(Children $w | Where-Object {$_.Current.ClassName -eq 'CommonChatItemDelegate'} | ForEach-Object {
+ @(ChatItems $w | ForEach-Object {
   $_.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1)
  })
 }
@@ -243,10 +361,13 @@ function RevealPhoto($w,$photo) {
  }
  return $false
 }
-function Messages($w) {
+function ChatItems($w) {
+ $condition=[System.Windows.Automation.PropertyCondition]::new([System.Windows.Automation.AutomationElement]::ClassNameProperty,'CommonChatItemDelegate')
+ $w.FindAll([System.Windows.Automation.TreeScope]::Descendants,$condition)
+}
+function Messages($items) {
  $messages=@(); $date=$null
- $items=Children $w | Where-Object {$_.Current.ClassName -eq 'CommonChatItemDelegate'} | Sort-Object {$_.Current.BoundingRectangle.Top}
- foreach($element in $items) {
+ foreach($element in ($items | Sort-Object {$_.Current.BoundingRectangle.Top})) {
   $sender=$null
   $label=$element.Current.Name
   if($label -match '^날짜 (.+)$'){$date=$Matches[1];continue}
@@ -269,12 +390,19 @@ function Messages($w) {
  }
  $messages
 }
-try {
- if(-not $script:process){throw 'KakaoTalkUI is not running'}
- $previousWindow=[KakaoInput]::GetForegroundWindow()
- $script:lastInput=[KakaoInput]::InputTick()
+function RunRequest($request) {
+ $script:roomHwnd=$null
+ $script:targetHwnd=$null
+ $previousWindow=[IntPtr]::Zero
+ try {
+ if($request.action -in 'copy','image','file','mention','download','open'){
+  InitializeInput
+  $previousWindow=[KakaoInput]::GetForegroundWindow()
+  $script:lastInput=[KakaoInput]::InputTick()
+ }
  $result = switch ($request.action) {
-  'health' { $w=Main; @{running=$true;hwnd=$w.Current.NativeWindowHandle;pid=$script:process.Id} }
+  'file' {SendFile}
+  'health' { $w=Main; @{running=$true;hwnd=$w.Current.NativeWindowHandle;pid=$request.process_id} }
   'rooms' { @{rooms=@(Windows | Where-Object {$_.Current.ClassName -match 'ChatWindow'} | ForEach-Object {@{title=$_.Current.Name;hwnd=$_.Current.NativeWindowHandle}})} }
   'open' {
    $existing=@(Windows | Where-Object {$_.Current.ClassName -match 'ChatWindow' -and $_.Current.Name -ceq $request.room})
@@ -296,9 +424,9 @@ try {
    $searchValue=Value $field
    $previousQuery=$searchValue.Current.Value
    try {
-    (Value $field).SetValue($request.room); Start-Sleep -Milliseconds 600
+    (Value $field).SetValue($request.room)
     $namePattern='^(?:(?:팀채팅|그룹채팅|나와의 채팅), )?'+[regex]::Escape($request.room)+', '
-    $matches=@(Children $w | Where-Object {$_.Current.ControlType -eq [System.Windows.Automation.ControlType]::ListItem -and ($_.Current.Name -ceq $request.room -or $_.Current.Name -cmatch $namePattern)})
+    $matches=@(WaitFor {Children $w | Where-Object {$_.Current.ControlType -eq [System.Windows.Automation.ControlType]::ListItem -and ($_.Current.Name -ceq $request.room -or $_.Current.Name -cmatch $namePattern)}} 3000)
     if($matches.Count -ne 1){throw "Expected one exact search result; found $($matches.Count)"}
     $lookup={Windows | Where-Object {$_.Current.ClassName -match 'ChatWindow' -and $_.Current.Name -ceq $request.room}}
     $opened=$null
@@ -380,12 +508,13 @@ try {
   }
   'read' {
    $w=Room $request.room
-   $messages=@(Messages $w)
+   $items=@(ChatItems $w)
+   $messages=@(Messages $items)
    $unknown=@('member_count')
    if($messages | Where-Object {-not $_.sender}){$unknown+='sender'}
    if($messages | Where-Object {-not $_.date}){$unknown+='date'}
    # Only trust scroll state from the actual message list, never another panel.
-   $item=Children $w | Where-Object {$_.Current.ClassName -eq 'CommonChatItemDelegate'} | Select-Object -First 1
+   $item=$items | Select-Object -First 1
    $atEnd=$null
    while($item -and -not [System.Windows.Automation.Automation]::Compare($item,$w)){
     $scroll=$null
@@ -416,7 +545,7 @@ try {
    $sequence=[KakaoInput]::GetClipboardSequenceNumber()
    Ctrl 67; Start-Sleep -Milliseconds 200
    $copied=[KakaoInput]::GetClipboardSequenceNumber()
-   if($copied -eq $sequence -or [KakaoInput]::ClipboardOwnerPid() -ne $script:process.Id){throw 'KakaoTalk did not copy a new transcript'}
+   if($copied -eq $sequence -or [KakaoInput]::ClipboardOwnerPid() -ne $request.process_id){throw 'KakaoTalk did not copy a new transcript'}
    $text=[System.Windows.Forms.Clipboard]::GetText()
    if(-not $text){throw 'Message copy returned an empty clipboard'}
    if([KakaoInput]::GetClipboardSequenceNumber() -ne $copied){throw 'Clipboard changed during transcript copy'}
@@ -442,11 +571,20 @@ try {
  }
  @{success=$true;data=$result} | ConvertTo-Json -Depth 14 -Compress
 } catch { @{success=$false;error=$_.Exception.Message} | ConvertTo-Json -Compress } finally {
- if($request.action -in 'copy','image','mention','download' -and $script:targetHwnd -and
+ if($request.action -in 'copy','image','file','mention','download' -and $script:targetHwnd -and
      $previousWindow -ne [IntPtr]::Zero -and [KakaoInput]::InputTick() -eq $script:lastInput){
   $current=[KakaoInput]::GetForegroundWindow()
   if($current -eq [IntPtr]$script:roomHwnd -and $current -ne $previousWindow){
    [void][KakaoInput]::SetForegroundWindow($previousWindow)
   }
+ }
+}
+}
+while($null -ne ($line=[Console]::ReadLine())){
+ try {
+  $json=RunRequest (ConvertFrom-Json -InputObject $line)
+  [Console]::WriteLine($json)
+ } catch {
+  [Console]::WriteLine((@{success=$false;error=$_.Exception.Message} | ConvertTo-Json -Compress))
  }
 }

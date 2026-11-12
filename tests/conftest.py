@@ -16,3 +16,4 @@ def isolate_desktop_io(monkeypatch):
         raise AssertionError('Unit tests must mock external process execution')
 
     monkeypatch.setattr(qt_controller.subprocess, 'run', reject_process)
+    monkeypatch.setattr(qt_controller.bridge, 'start', reject_process)

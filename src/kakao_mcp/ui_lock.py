@@ -15,7 +15,10 @@ _lock_state = threading.local()
 @contextlib.contextmanager
 def operation():
     """Serialize UI operations across clients as well as monitor threads."""
-    with _thread_lock:
+    deadline = time.monotonic() + 8
+    if not _thread_lock.acquire(timeout=8):
+        raise TimeoutError('Another KakaoTalk operation is busy; no action started')
+    try:
         if getattr(_lock_state, 'held', False):
             yield
             return
@@ -24,7 +27,6 @@ def operation():
             if stream.seek(0, 2) == 0:
                 stream.write(b'0')
                 stream.flush()
-            deadline = time.monotonic() + 60
             while True:
                 stream.seek(0)
                 try:
@@ -32,7 +34,7 @@ def operation():
                     break
                 except OSError:
                     if time.monotonic() >= deadline:
-                        raise TimeoutError('Another KakaoTalk operation is busy')
+                        raise TimeoutError('Another KakaoTalk operation is busy; no action started')
                     time.sleep(.1)
             try:
                 _lock_state.held = True
@@ -41,3 +43,5 @@ def operation():
                 _lock_state.held = False
                 stream.seek(0)
                 msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+    finally:
+        _thread_lock.release()
