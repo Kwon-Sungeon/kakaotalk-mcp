@@ -14,6 +14,7 @@ public class KakaoInput {
  [StructLayout(LayoutKind.Sequential)] private struct LastInput { public uint Size; public uint Tick; }
  [DllImport("user32.dll")] private static extern bool GetLastInputInfo(ref LastInput info);
  public static uint InputTick(){var info=new LastInput{Size=8}; if(!GetLastInputInfo(ref info)) throw new InvalidOperationException("Input time unavailable"); return info.Tick;}
+ [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
  [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr SendMessageTimeoutW(IntPtr hwnd,uint message,IntPtr w,IntPtr l,uint flags,uint timeout,out IntPtr result);
  public static bool ReplaceFilename(IntPtr hwnd,string text){
@@ -40,6 +41,7 @@ public class KakaoInput {
  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int n);
  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
  [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h,uint cmd);
+ [DllImport("user32.dll")] public static extern bool IsChild(IntPtr h,IntPtr child);
  [DllImport("user32.dll")] public static extern IntPtr GetLastActivePopup(IntPtr h);
  [DllImport("user32.dll")] public static extern bool SetCursorPos(int x,int y);
  [DllImport("user32.dll")] public static extern void mouse_event(uint f,int x,int y,int d,UIntPtr e);
@@ -199,7 +201,7 @@ function InputBox($w){
 function SendButton($container) {
  $buttons=@(Children $container | Where-Object {
   $_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and
-  $_.Current.Name -match '^(전송|보내기)$' -and $_.Current.IsEnabled -and -not $_.Current.IsOffscreen
+  $_.Current.Name.Replace('&','') -match '^(전송|보내기|Send)(\([A-Za-z]\))?$' -and $_.Current.IsEnabled -and -not $_.Current.IsOffscreen
  })
  if($buttons.Count -ne 1){throw 'Unique enabled send button not found'}
  $buttons[0]
@@ -217,7 +219,7 @@ function FileRoom {
 }
 function OwnedPopup {
  foreach($h in @([KakaoInput]::GetLastActivePopup([IntPtr]$request.hwnd),[KakaoInput]::GetForegroundWindow())){
-  if($h -eq [IntPtr]::Zero -or $h -eq [IntPtr]$request.hwnd){continue}
+  if($h -eq [IntPtr]::Zero -or $h -eq [IntPtr]$request.hwnd -or -not [KakaoInput]::IsWindowVisible($h)){continue}
   $owner=$h
   for($level=0;$level -lt 5;$level++){
    $owner=[KakaoInput]::GetWindow($owner,4)
@@ -234,11 +236,19 @@ function FilePick($w) {
  if((OwnedPopup) -or -not $w.Current.IsEnabled){throw 'Close the existing room dialog before attaching'}
  if($request.qt){
   AssertDraft (InputBox $w) ''
-  $buttons=@(Children $w | Where-Object {$_.Current.ControlType -eq [System.Windows.Automation.ControlType]::Button -and $_.Current.Name -in '파일 전송','Send file','Send files'})
-  if($buttons.Count -ne 1){throw 'Unique file attachment button not found'}
-  $invoke=$null
-  if($buttons[0].TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$invoke)){$invoke.Invoke()}
-  else{Front $w; Click $buttons[0]}
+  if(-not $request.sequence){throw 'File clipboard sequence required'}
+  Front $w
+  $inputElement=InputBox (FileRoom)
+  $inputElement.SetFocus()
+  Add-Type -AssemblyName System.Windows.Forms
+  $paths=[System.Windows.Forms.Clipboard]::GetFileDropList()
+  if($paths.Count -ne 1 -or $paths[0] -cne $request.path){throw 'File clipboard changed'}
+  AssertDraft $inputElement ''
+  if(-not [System.Windows.Automation.Automation]::Compare($inputElement,[System.Windows.Automation.AutomationElement]::FocusedElement) -or
+     [KakaoInput]::GetClipboardSequenceNumber() -ne $request.sequence){throw 'File input or clipboard changed'}
+  $script:dispatched=$true
+  Ctrl 86
+  return
  }else{
   Front $w
   if((OwnedPopup) -or -not (FileRoom).Current.IsEnabled){throw 'Legacy room has an open dialog'}
@@ -266,8 +276,9 @@ function SelectFilePath {
  if(-not $matchesPath -or (OwnedPopup).Current.NativeWindowHandle -ne $picker.Current.NativeWindowHandle){throw 'File picker or selected path changed'}
  $null=FileRoom
  if($ok[0].Current.ClassName -eq 'Button' -and $ok[0].Current.NativeWindowHandle){
+  $script:dispatched=$true
   if(-not [KakaoInput]::PostMessageW([IntPtr]$ok[0].Current.NativeWindowHandle,0xF5,[IntPtr]::Zero,[IntPtr]::Zero)){throw 'Could not submit selected file'}
- }else{Invoke $ok[0]}
+ }else{$script:dispatched=$true; Invoke $ok[0]}
 }
 function FileEvidence($container, $name) {
  $els=@(Children $container)
@@ -310,10 +321,67 @@ function SendFile {
     Invoke $button
     $clicked=$true
    }
-  }elseif($clicked -and -not $preview){return @{sent=$true;confirmation='preview_closed'}}
+  }elseif(-not $request.qt -and $clicked -and -not $preview -and (FileRoom).Current.IsEnabled){
+   return @{sent=$true;confirmation='verified_file_preview_closed'}
+  }
   Start-Sleep -Milliseconds 120
  }while([DateTime]::UtcNow -lt $deadline)
- throw 'File submitted to the picker, but sending could not be confirmed. Inspect the room; do not retry automatically.'
+ throw 'File attachment started, but sending could not be confirmed. Inspect the room; do not retry automatically.'
+}
+function AssertRoomReady($w) {
+ if(-not $w.Current.IsEnabled -or (OwnedPopup)){throw 'Room has an open dialog'}
+ $modal=Children $w | Where-Object {
+   -not $_.Current.IsOffscreen -and $_.Current.ClassName -match '(ClipboardImageWindow|File.*(Window|Dialog)|Confirm.*(Window|Dialog))'
+ } | Select-Object -First 1
+ if($modal){throw 'Room has an open preview or confirmation dialog'}
+}
+function ExactItem($list, $name) {
+ $items=@(Children $list | Where-Object {
+  $_.Current.Name -ceq $name -and -not $_.Current.IsOffscreen -and $_.Current.IsEnabled -and
+  $_.Current.ControlType -in [System.Windows.Automation.ControlType]::ListItem,[System.Windows.Automation.ControlType]::DataItem
+ })
+ if($items.Count -gt 1){throw 'Ambiguous exact list items'}
+ if($items.Count -eq 1){return $items[0]}
+}
+function LegacyOpenResult {
+ $main=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$request.hwnd)
+ $list=[System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$request.list_hwnd)
+ if($main.Current.ProcessId -ne $request.process_id -or $list.Current.ProcessId -ne $request.process_id -or
+    -not [KakaoInput]::IsChild([IntPtr]$request.hwnd,[IntPtr]$request.list_hwnd)){throw 'Search list owner changed'}
+ $item=WaitFor {ExactItem $list $request.room} 2200
+ if(-not $item){throw 'Cannot verify exact room in legacy search results; open the room manually'}
+ if(-not [KakaoInput]::FilenameEquals([IntPtr]$request.edit_hwnd,$request.room)){throw 'Search text changed'}
+ $current=ExactItem $list $request.room
+ if(-not $current -or -not [System.Windows.Automation.Automation]::Compare($item,$current)){throw 'Room search results changed'}
+ $pattern=$null
+ if($current.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$pattern)){$pattern.Invoke()}
+ else{Front $main; Click $current $true}
+ @{opened=$true}
+}
+function LegacyMention {
+ $w=FileRoom
+ $lists=@(Children $w | Where-Object {$_.Current.ClassName -match 'mention' -and
+           $_.Current.ControlType -in [System.Windows.Automation.ControlType]::List,[System.Windows.Automation.ControlType]::Pane})
+ $popup=OwnedPopup
+ if($popup -and ($popup.Current.ClassName -match 'mention' -or $popup.Current.Name -in '멘션','Mention')){$lists=@($popup)}
+ if($lists.Count -ne 1){throw 'Cannot verify legacy mention popup; draft preserved'}
+ $candidate=ExactItem $lists[0] $request.mention
+ if(-not $candidate){throw 'Cannot verify unique exact legacy mention candidate; draft preserved'}
+ $null=FileRoom
+ Invoke $candidate
+ @{selected=$true}
+}
+function LegacyImageConfirm {
+ $w=FileRoom
+ $preview=WaitFor {OwnedPopup} 2500
+ if(-not $preview -or ($preview.Current.ClassName -notmatch '(ClipboardImage|ImageSend|PhotoSend)' -and
+    $preview.Current.Name -notin '사진 전송','이미지 전송','사진 보내기','Send photo','Send image')){throw 'Cannot verify photo preview in the exact room'}
+ $button=SendButton $preview
+ $null=FileRoom
+ if(-not [System.Windows.Automation.Automation]::Compare($preview,(OwnedPopup))){throw 'Photo preview changed'}
+ Invoke $button
+ if(-not (WaitFor {if(-not (OwnedPopup) -and (FileRoom).Current.IsEnabled){$true}} 2200)){throw 'Photo send unconfirmed'}
+ @{sent=$true;confirmation='verified_photo_preview_closed'}
 }
 function ChatTab($w){
  $tab=Children $w | Where-Object {$_.Current.Name -eq '채팅' -and $_.Current.ClassName -like 'TabMenuButton*'} | Select-Object -First 1
@@ -391,16 +459,32 @@ function Messages($items) {
  $messages
 }
 function RunRequest($request) {
+ $script:dispatched=$false
  $script:roomHwnd=$null
  $script:targetHwnd=$null
  $previousWindow=[IntPtr]::Zero
  try {
- if($request.action -in 'copy','image','file','mention','download','open'){
+ if($request.action -in 'send','copy','image','file','mention','download','open','legacy_open_result','legacy_select_mention','legacy_image_confirm','legacy_send_button'){
   InitializeInput
   $previousWindow=[KakaoInput]::GetForegroundWindow()
   $script:lastInput=[KakaoInput]::InputTick()
  }
  $result = switch ($request.action) {
+  'legacy_send_button' {
+   $w=FileRoom
+   if((OwnedPopup) -or -not $w.Current.IsEnabled){throw 'Room has an open dialog'}
+   AssertRoomReady $w
+   $button=SendButton $w
+   $draft=$request.text.Replace("`r`n","`n").Replace("`n","`r`n")
+   if(-not [KakaoInput]::FilenameEquals([IntPtr]$request.edit_hwnd,$draft)){throw 'Draft changed'}
+   $null=FileRoom
+   $script:dispatched=$true
+   Invoke $button
+   @{submitted=$true}
+  }
+  'legacy_open_result' {LegacyOpenResult}
+  'legacy_select_mention' {LegacyMention}
+  'legacy_image_confirm' {$script:dispatched=$true; LegacyImageConfirm}
   'file' {SendFile}
   'health' { $w=Main; @{running=$true;hwnd=$w.Current.NativeWindowHandle;pid=$request.process_id} }
   'rooms' { @{rooms=@(Windows | Where-Object {$_.Current.ClassName -match 'ChatWindow'} | ForEach-Object {@{title=$_.Current.Name;hwnd=$_.Current.NativeWindowHandle}})} }
@@ -449,11 +533,15 @@ function RunRequest($request) {
    $i.SetFocus()
    if(-not [System.Windows.Automation.Automation]::Compare($i,[System.Windows.Automation.AutomationElement]::FocusedElement)){throw 'Chat input lost focus'}
    if([KakaoInput]::GetClipboardSequenceNumber() -ne $request.sequence){throw 'Clipboard image changed'}
+   $null=Room $request.room
+   $script:dispatched=$true
    Ctrl 86
    Start-Sleep -Milliseconds 600
    $dialogs=@(Children $w | Where-Object {$_.Current.ClassName -like 'ClipboardImageWindow*'})
    if($dialogs.Count -ne 1){throw 'Unique image preview not found in target room'}
    $button=SendButton $dialogs[0]
+   $null=Room $request.room
+   $script:dispatched=$true
    Invoke $button; Start-Sleep -Milliseconds 500
    if(Children $w | Where-Object {$_.Current.ClassName -like 'ClipboardImageWindow*'}){throw 'Image send outcome uncertain; do not retry automatically'}
    @{sent=$true}
@@ -484,6 +572,7 @@ function RunRequest($request) {
   }
   'mention' {
    $w=Room $request.room; Front $w; $i=InputBox $w; $v=Value $i
+   AssertRoomReady $w
    if($v.Current.Value){throw 'Chat has an existing draft'}
    ActivateMention $i
    $list=Children $w | Where-Object {$_.Current.ClassName -like 'MentionSuggestionList*'} | Select-Object -First 1
@@ -499,9 +588,12 @@ function RunRequest($request) {
    if($popup -or $selected -cne $prefix){throw 'Selected mention token could not be verified'}
    PasteText $i $request.text
    if(Children $w | Where-Object {$_.Current.ClassName -like 'ClipboardImageWindow*'}){throw 'Image preview is open in target room'}
+   AssertRoomReady $w
    $button=SendButton $w
    AssertDraft $i ($prefix+$request.text)
    if($request.preview){@{ready=$true};break}
+   $null=Room $request.room
+   $script:dispatched=$true
    Invoke $button; Start-Sleep -Milliseconds 500
    if((Value (InputBox $w)).Current.Value){throw 'Mention send outcome uncertain; do not retry automatically'}
    @{sent=$true}
@@ -524,7 +616,7 @@ function RunRequest($request) {
     }
     $item=[System.Windows.Automation.TreeWalker]::RawViewWalker.GetParent($item)
    }
-   @{room_name=$w.Current.Name;member_count=$null;messages=$messages;dates=@();partial=$true;read_method='uia';unknown_fields=$unknown;at_end=$atEnd}
+   @{room_name=$w.Current.Name;hwnd=$w.Current.NativeWindowHandle;process_id=$request.process_id;member_count=$null;messages=$messages;dates=@();partial=$true;read_method='uia';unknown_fields=$unknown;at_end=$atEnd}
   }
   'copy' {
    $w=Room $request.room; Front $w
@@ -553,24 +645,40 @@ function RunRequest($request) {
   }
   'send' {
    $w=Room $request.room; $i=InputBox $w; $v=Value $i
+   AssertRoomReady $w
    $before=@(Snapshot $w | Where-Object {$_.StartsWith($request.text+', ')}).Count
    if($v.Current.Value){throw 'Chat has an existing draft'}
    $v.SetValue($request.text)
    if($v.Current.Value -cne $request.text){throw 'Input verification failed'}
    if(Children $w | Where-Object {$_.Current.ClassName -like 'ClipboardImageWindow*'}){throw 'Image preview is open in target room'}
+   AssertRoomReady $w
    $button=SendButton $w
    AssertDraft $i $request.text
+   $null=Room $request.room
+   $script:dispatched=$true
    Invoke $button; Start-Sleep -Milliseconds 500
    $fresh=Value (InputBox $w)
    if($fresh.Current.Value){throw 'Send outcome uncertain; do not retry automatically'}
    $after=@(Snapshot $w | Where-Object {$_.StartsWith($request.text+', ')}).Count
-   if($after -le $before){throw 'New message bubble not confirmed; do not retry automatically'}
-   @{sent=$true}
+   if($after -le $before){
+    $confirmed=WaitFor {if(@(Snapshot (Room $request.room) | Where-Object {$_.StartsWith($request.text+', ')}).Count -gt $before){$true}} 1800
+    if(-not $confirmed){throw 'New message bubble not confirmed; do not retry automatically'}
+   }
+   @{sent=$true;confirmation='new_room_bubble'}
   }
   default {throw "Unknown action $($request.action)"}
  }
  @{success=$true;data=$result} | ConvertTo-Json -Depth 14 -Compress
-} catch { @{success=$false;error=$_.Exception.Message} | ConvertTo-Json -Compress } finally {
+} catch {
+ $message=$_.Exception.Message
+ $code=if($script:dispatched){'send_unconfirmed'}
+       elseif($message -match 'multiple|ambiguous|found (?:[2-9]|[1-9][0-9]+)\b'){ 'room_ambiguous' }
+       elseif($message -match 'existing draft'){ 'draft_exists' }
+       elseif($message -match 'window changed|room changed'){ 'room_changed' }
+       elseif($message -match 'found 0|room not found'){ 'room_not_found' }
+       else{'target_not_verified'}
+ @{success=$false;error=$message;before_send=(-not $script:dispatched);code=$code} | ConvertTo-Json -Compress
+} finally {
  if($request.action -in 'copy','image','file','mention','download' -and $script:targetHwnd -and
      $previousWindow -ne [IntPtr]::Zero -and [KakaoInput]::InputTick() -eq $script:lastInput){
   $current=[KakaoInput]::GetForegroundWindow()

@@ -8,6 +8,13 @@ import subprocess
 import threading
 
 
+class WorkerError(RuntimeError):
+    def __init__(self, response):
+        super().__init__(response['error'])
+        self.before_send = response.get('before_send', False)
+        self.code = response.get('code') or 'operation_failed'
+
+
 class Bridge:
     def __init__(self):
         self.process = None
@@ -70,7 +77,7 @@ class Bridge:
             detail = line.strip()[:300] if 'line' in locals() else str(error)
             raise RuntimeError(f'UI Automation worker failed: {detail}. Check the room before retrying.') from error
         if not response['success']:
-            raise RuntimeError(response['error'])
+            raise WorkerError(response)
         return response['data']
 
 

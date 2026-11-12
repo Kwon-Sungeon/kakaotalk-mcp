@@ -3,6 +3,11 @@
 import os
 import time
 import sys
+import json
+from functools import wraps
+from mcp.types import CallToolResult, TextContent
+from . import delivery
+from .ui_lock import operation
 from typing import Dict, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -15,13 +20,30 @@ ReadMode = Literal["auto", "background", "complete"]
 
 app = FastMCP(
     "kakao-mcp-server",
-    instructions=("Use kakao_open_room with the exact title for a closed room; list_open_rooms only lists "
-                  "open windows. Use kakao_send_file for documents and kakao_send_image for photos. "
-                  "If sending is unconfirmed, report the result; do not retry using computer use."),
+    instructions=("Call the appropriate send tool directly with the exact room title. It opens and verifies "
+                  "the room. Pass room_ref if one was returned for this room. For a retry reuse request_id. "
+                  "On partial or unconfirmed results inspect the item statuses; never replay via another tool. "
+                  "Use send_image for photos, send_file for documents, and send_mention for an actual mention."),
 )
 
 
-@app.tool()
+def tool(function):
+    @wraps(function)
+    def invoke(*args, **kwargs):
+        try:
+            result = function(*args, **kwargs)
+        except Exception as error:
+            result = {"error": str(error), "code": delivery.error_code(error)}
+        failed = "error" in result or result.get("success") is False
+        if failed:
+            result.setdefault("code", delivery.error_code(result.get("error", "")))
+        return CallToolResult(isError=failed, structuredContent=result,
+                              content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False))])
+    app.tool(structured_output=False)(invoke)
+    return function
+
+
+@tool
 def kakao_health_check(diagnostics: bool = False) -> Dict:
     """Check KakaoTalk status and report the MCP version and detected backend.
     diagnostics also probes read-only window discovery and reports its duration."""
@@ -53,7 +75,7 @@ def kakao_health_check(diagnostics: bool = False) -> Dict:
         return {**report, "error": f"Health check failed: {error}"}
 
 
-@app.tool()
+@tool
 def kakao_list_open_rooms() -> Dict:
     """List all currently open KakaoTalk chat room windows.
     Returns a list of open chat rooms with their window titles."""
@@ -70,7 +92,7 @@ def kakao_list_open_rooms() -> Dict:
         return {"error": f"Failed to list rooms: {e}"}
 
 
-@app.tool()
+@tool
 def kakao_open_room(room_name: str, focus: bool = False) -> Dict:
     """Open a KakaoTalk chat room by name. An existing room keeps its position.
     Set focus=true when the user wants to see the room.
@@ -79,109 +101,55 @@ def kakao_open_room(room_name: str, focus: bool = False) -> Dict:
     Args:
         room_name: The name of the chat room or person to open.
     """
-    try:
-        hwnd = controller.find_chat_window(room_name)
-        if hwnd:
-            if focus:
-                controller.bring_window_to_front(hwnd)
-            return {"message": f"Chat room '{room_name}' is open", "hwnd": hwnd}
-        result = controller.search_and_open_room(room_name)
-        if result["success"]:
-            if focus and result.get("hwnd"):
-                controller.bring_window_to_front(result["hwnd"])
-            return {"message": result["message"], "hwnd": result.get("hwnd")}
-        return {"error": result["error"]}
-    except Exception as e:
-        return {"error": f"Failed to open room '{room_name}': {e}"}
+    with operation():
+        room = delivery.resolve(room_name)
+        if focus:
+            room.verify()
+            controller.bring_window_to_front(room.hwnd)
+        return {"message": f"Opened '{room_name}'", "hwnd": room.hwnd, "room_ref": room.ref}
 
 
-@app.tool()
-def kakao_send_message(room_name: str, message: str) -> Dict:
-    """Send a text message to a KakaoTalk chat room.
-    The chat room window must already be open.
-
-    Args:
-        room_name: Exact title of the chat room window.
-        message: The text message to send.
-    """
-    try:
-        if not message.strip():
-            return {"error": "Message cannot be empty"}
-        result = controller.send_message_to_room(room_name, message)
-        if result["success"]:
-            return {"message": result["message"]}
-        return {"error": result["error"]}
-    except Exception as e:
-        return {"error": f"Failed to send message: {e}"}
+@tool
+def kakao_send_message(room_name: str, message: str, room_ref: Optional[str] = None,
+                       request_id: Optional[str] = None) -> Dict:
+    """Open the exact room and send text once. Reuse request_id for retries; room_ref pins a previous open."""
+    return delivery.deliver('text', [(room_name, message)], refs={room_name: room_ref} if room_ref else None,
+                            request_id=request_id)
 
 
-@app.tool()
-def kakao_send_bulk(room_names: list[str], message: str, interval_sec: float = 0.5) -> Dict:
-    """Send the same message to multiple KakaoTalk chat rooms at once.
-    Opens each room if not already open and sends the message sequentially.
-    Maintains a safe interval between rooms to ensure reliability.
-
-    Args:
-        room_names: List of chat room names or person names to send to.
-        message: The text message to send to all rooms.
-        interval_sec: Seconds to wait between rooms (default 0.5, minimum 0.3).
-    """
-    try:
-        if not room_names:
-            return {"error": "room_names cannot be empty"}
-        if not message.strip():
-            return {"error": "Message cannot be empty"}
-        result = controller.send_bulk_messages(room_names, message, interval_sec)
-        if result["success"]:
-            return {"message": result["message"], "results": result["results"]}
-        return {"error": result.get("error") or result.get("message", "Failed to send bulk messages"), "results": result.get("results", [])}
-    except Exception as e:
-        return {"error": f"Failed to send bulk messages: {e}"}
+@tool
+def kakao_send_bulk(room_names: list[str], message: str, interval_sec: float = 0.5,
+                    request_id: Optional[str] = None, room_refs: Optional[dict[str, str]] = None) -> Dict:
+    """Open each unique exact room and send once. On failure stop and return all per-room statuses."""
+    return delivery.deliver('text', [(room, message) for room in room_names], refs=room_refs,
+                            request_id=request_id, interval=max(.3, interval_sec))
 
 
-@app.tool()
-def kakao_send_file(room_name: str, file_paths: list[str]) -> Dict:
-    """Attach documents or other local files through an open room's file picker.
-    Use absolute paths. Results identify completed items; never retry an uncertain send automatically."""
-    from .attachments import send_files
-    return send_files(room_name, file_paths)
+@tool
+def kakao_send_file(room_name: str, file_paths: list[str], room_ref: Optional[str] = None,
+                    request_id: Optional[str] = None) -> Dict:
+    """Open the exact room and attach local documents by absolute path. Reuse request_id on retry."""
+    return delivery.deliver('file', [(room_name, path) for path in file_paths],
+                            refs={room_name: room_ref} if room_ref else None, request_id=request_id)
 
 
-@app.tool()
-def kakao_send_image(room_name: str, image_paths: list[str]) -> Dict:
-    """Send image file(s) to a KakaoTalk chat room.
-    Copies the image to clipboard as bitmap data and pastes into the chat.
-    KakaoTalk shows a confirmation dialog which is automatically accepted.
-    The chat room window must already be open.
-    NOTE: This briefly brings the chat window to the foreground.
-
-    Args:
-        room_name: Exact title of the chat room window.
-        image_paths: List of absolute file paths to images (JPG, PNG, GIF, BMP, WebP).
-    """
-    try:
-        if not image_paths:
-            return {"error": "image_paths cannot be empty"}
-
-        for path in image_paths:
-            if not os.path.isfile(os.path.abspath(path)):
-                return {"error": f"Image file not found: {path}"}
-
-        if len(image_paths) == 1:
-            result = controller.send_image_to_room(room_name, image_paths[0])
-            if result["success"]:
-                return {"message": result["message"]}
-            return {"error": result["error"]}
-        else:
-            result = controller.send_images_to_room(room_name, image_paths)
-            if result["success"]:
-                return {"message": result["message"], "results": result["results"]}
-            return {"error": result.get("error") or result.get("message", "Failed to send images"), "results": result.get("results", [])}
-    except Exception as e:
-        return {"error": f"Failed to send image: {e}"}
+@tool
+def kakao_send_image(room_name: str, image_paths: list[str], room_ref: Optional[str] = None,
+                     request_id: Optional[str] = None) -> Dict:
+    """Open the exact room and send photos by absolute path. Returns a status for every image."""
+    return delivery.deliver('image', [(room_name, path) for path in image_paths],
+                            refs={room_name: room_ref} if room_ref else None, request_id=request_id)
 
 
-@app.tool()
+@tool
+def kakao_delivery_status(request_id: str, item_index: Optional[int] = None,
+                          user_verified: Optional[Literal['sent', 'not_sent']] = None) -> Dict:
+    """Read a delivery receipt. Only after the user verifies the chat, record an uncertain item's outcome
+    with its zero-based item_index and user_verified. This tool never sends anything."""
+    return delivery.receipt(request_id, item_index, user_verified)
+
+
+@tool
 def kakao_read_messages(room_name: str, max_messages: Optional[int] = None, read_mode: Optional[ReadMode] = None) -> Dict:
     """Read recent messages from a KakaoTalk chat room.
     Reads locally loaded messages using the selected UI backend.
@@ -200,7 +168,7 @@ def kakao_read_messages(room_name: str, max_messages: Optional[int] = None, read
             return {"error": "max_messages must be positive"}
         result = controller.read_chat_messages(room_name, read_mode, max_messages)
         if not result["success"]:
-            return {"error": result["error"]}
+            return {"error": result["error"], "code": result.get("code", "read_failed")}
         parsed = result.get('parsed') or parser.parse_chat_text(result["raw_text"])
         messages = parsed["messages"]
         max_messages = max_messages or 50
@@ -214,6 +182,7 @@ def kakao_read_messages(room_name: str, max_messages: Optional[int] = None, read
             "partial": parsed.get("partial", False),
             "read_method": parsed.get("read_method", "clipboard"),
             "unknown_fields": parsed.get("unknown_fields", []),
+            **({"scope": parsed["scope"]} if "scope" in parsed else {}),
             **({"at_end": parsed["at_end"]} if "at_end" in parsed else {}),
             **({"detail_error": parsed["detail_error"]} if "detail_error" in parsed else {}),
         }
@@ -221,7 +190,7 @@ def kakao_read_messages(room_name: str, max_messages: Optional[int] = None, read
         return {"error": f"Failed to read messages: {e}"}
 
 
-@app.tool()
+@tool
 def kakao_extract_links(room_name: str, read_mode: Optional[ReadMode] = None) -> Dict:
     """Extract all URLs/links from messages in a KakaoTalk chat room.
     Auto and complete request the full locally loaded transcript. Background
@@ -233,7 +202,7 @@ def kakao_extract_links(room_name: str, read_mode: Optional[ReadMode] = None) ->
     try:
         result = controller.read_chat_messages(room_name, read_mode, all_history=True)
         if not result["success"]:
-            return {"error": result["error"]}
+            return {"error": result["error"], "code": result.get("code", "read_failed")}
         parsed = result.get('parsed') or parser.parse_chat_text(result["raw_text"])
         urls = parser.extract_urls_from_messages(parsed["messages"])
         return {
@@ -246,32 +215,15 @@ def kakao_extract_links(room_name: str, read_mode: Optional[ReadMode] = None) ->
         return {"error": f"Failed to extract links: {e}"}
 
 
-@app.tool()
-def kakao_send_mention(room_name: str, mention_name: str, message: str) -> Dict:
-    """Send a message with @mention to a KakaoTalk chat room.
-    Types '@' to activate the mention popup, selects the target user,
-    then sends the message. The chat room window must already be open.
-    NOTE: This briefly brings the chat window to the foreground.
-
-    Args:
-        room_name: Exact title of the chat room window.
-        mention_name: Display name of the person to mention (e.g. '홍길동').
-        message: The text message to send after the mention.
-    """
-    try:
-        if not mention_name.strip():
-            return {"error": "Mention name cannot be empty"}
-        if not message.strip():
-            return {"error": "Message cannot be empty"}
-        result = controller.send_mention_message(room_name, mention_name, message)
-        if result["success"]:
-            return {"message": result["message"]}
-        return {"error": result["error"]}
-    except Exception as e:
-        return {"error": f"Failed to send mention message: {e}"}
+@tool
+def kakao_send_mention(room_name: str, mention_name: str, message: str, room_ref: Optional[str] = None,
+                       request_id: Optional[str] = None) -> Dict:
+    """Open the exact room, verify the exact mention candidate and selected draft, then send once."""
+    return delivery.deliver('mention', [(room_name, message)], mention=mention_name,
+                            refs={room_name: room_ref} if room_ref else None, request_id=request_id)
 
 
-@app.tool()
+@tool
 def kakao_download_images(
     room_name: str,
     output_dir: Optional[str] = None,
@@ -297,7 +249,7 @@ def kakao_download_images(
         return {"error": f"Failed to download images: {e}"}
 
 
-@app.tool()
+@tool
 def kakao_start_monitor(
     room_name: str,
     keywords: list[str],
@@ -327,7 +279,7 @@ def kakao_start_monitor(
         return {"error": f"Failed to start monitor: {e}"}
 
 
-@app.tool()
+@tool
 def kakao_stop_monitor() -> Dict:
     """Stop the running chat room monitor."""
     try:
@@ -339,7 +291,7 @@ def kakao_stop_monitor() -> Dict:
         return {"error": f"Failed to stop monitor: {e}"}
 
 
-@app.tool()
+@tool
 def kakao_get_monitor_events() -> Dict:
     """Get pending keyword match events from the chat monitor.
     Returns events detected since last call. Each event includes:

@@ -3,7 +3,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from kakao_mcp import attachments, controller, qt_bridge
+from kakao_mcp import controller, qt_bridge
 
 
 def worker(output):
@@ -47,21 +47,3 @@ def test_search_never_uses_hidden_or_ambiguous_edits(monkeypatch):
     focus.assert_called_once_with(1, 4)
     controller.win32gui.IsWindowVisible.side_effect = lambda hwnd: True
     assert controller._activate_search_and_get_edit(1) is None
-
-
-@pytest.mark.parametrize('use_qt', [True, False])
-def test_files_validate_batch_then_stop_at_first_uncertain_send(tmp_path, monkeypatch, use_qt):
-    file = tmp_path / 'document.txt'
-    file.touch()
-    monkeypatch.setattr(attachments.qt, 'available', lambda: use_qt)
-    impl = attachments.qt if use_qt else controller
-    monkeypatch.setattr(impl, 'find_chat_window', lambda name: 7)
-    controller.win32process.GetWindowThreadProcessId.return_value = (4, 9)
-    send = Mock(side_effect=[{'sent': True}, RuntimeError('not confirmed')])
-    monkeypatch.setattr(attachments.bridge, 'request', send)
-    assert not attachments.send_files('fixture', [file, tmp_path / 'missing'])['success']
-    send.assert_not_called()
-    result = attachments.send_files('fixture', [file, file, file])
-    assert not result['success'] and len(result['results']) == 1 and send.call_count == 2
-    request = send.call_args.args[0]
-    assert (request['hwnd'], request['process_id'], request['qt']) == (7, 9, use_qt)

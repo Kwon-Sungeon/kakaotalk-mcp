@@ -10,7 +10,7 @@ $clause = $switch.Clauses | Where-Object {$_.Item1.Value -eq 'mention'}
 $body = $clause.Item2.Extent.Text
 # Reject new dependencies before executing the clause in this harness.
 $allowed = 'Room','Front','InputBox','Value','ActivateMention','Children','Where-Object',
-           'Select-Object','Click','Key','Start-Sleep','PasteText','SendButton','AssertDraft','Invoke'
+           'Select-Object','Click','Key','Start-Sleep','PasteText','SendButton','AssertDraft','AssertRoomReady','Invoke'
 foreach($command in $clause.Item2.FindAll({param($n) $n -is [Management.Automation.Language.CommandAst]},$true)){
  if($command.GetCommandName() -notin $allowed){throw "Unmocked command: $command"}
 }
@@ -19,6 +19,7 @@ foreach($member in $clause.Item2.FindAll({param($n) $n -is [Management.Automatio
 }
 $action = [scriptblock]::Create("switch ('mention') { 'mention' $body }")
 function Room($name){if($name -cne 'fixture'){throw 'Wrong room'}; 'fixture'}
+function AssertRoomReady($w){if($w -ne 'fixture'){throw 'Wrong room'}}
 function Front($w){if($w -cne 'fixture'){throw 'Wrong foreground'}}
 function InputBox($w){'input'}
 function Value($i){@{Current=@{Value=$script:draft}}}
@@ -107,3 +108,18 @@ if(-not (FileEvidence @($label,$button) 'fixture.pdf')){throw 'Expected exact ma
 if(FileEvidence @($label,$button) 'other.pdf'){throw 'Accepted different file'}
 if(FileEvidence @($label,$button,$button) 'fixture.pdf'){throw 'Accepted ambiguous buttons'}
 '3 isolated file preview scenarios passed'
+
+# The legacy photo path must not press Enter or accept another popup belonging
+# to this room. Exercise the shipped guards without loading its input APIs.
+$legacyPhoto=$ast.Find({param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'LegacyImageConfirm'},$true)
+foreach($command in $legacyPhoto.FindAll({param($n) $n -is [Management.Automation.Language.CommandAst]},$true)){
+ if($command.GetCommandName() -notin 'FileRoom','WaitFor','OwnedPopup','SendButton','Invoke'){throw "Unexpected input command: $command"}
+}
+. ([scriptblock]::Create($legacyPhoto.Extent.Text))
+function FileRoom {@{Current=@{IsEnabled=$true}}}
+function OwnedPopup {@{Current=@{Name='Other settings';ClassName='Window'}}}
+function Invoke {throw 'Invoked an unrelated dialog'}
+$failure=''
+try {LegacyImageConfirm} catch {$failure=$_.Exception.Message}
+if($failure -notlike '*Cannot verify photo preview*'){throw "Wrong popup handling: $failure"}
+'Legacy unrelated photo popup rejected'

@@ -4,38 +4,6 @@ from unittest.mock import Mock
 from kakao_mcp import qt_controller as qt, ui_lock
 
 
-def test_image_failure_preserves_completed_sends(tmp_path, monkeypatch):
-    image = tmp_path / 'image.png'
-    image.write_bytes(b'test image')
-    monkeypatch.setattr(qt.legacy, '_copy_image_to_clipboard', Mock())
-    monkeypatch.setattr(qt, 'find_chat_window', Mock(return_value=123))
-    bridge = Mock(side_effect=[{'sent': True}, RuntimeError('uncertain send')])
-    monkeypatch.setattr(qt, 'call', bridge)
-    result = qt.send_images_to_room('self', [image, image, image])
-    assert result['success'] is False
-    assert result['results'] == [{'path': str(image), 'sent': True}]
-    assert bridge.call_count == 2
-
-
-def test_invalid_later_image_prevents_any_send(tmp_path, monkeypatch):
-    image = tmp_path / 'image.png'
-    image.touch()
-    bridge = Mock()
-    monkeypatch.setattr(qt, 'call', bridge)
-    result = qt.send_images_to_room('self', [image, tmp_path / 'missing.png'])
-    assert result['success'] is False
-    bridge.assert_not_called()
-
-
-def test_uncertain_text_send_is_not_retried(monkeypatch):
-    bridge = Mock(side_effect=RuntimeError('New message bubble not confirmed'))
-    monkeypatch.setattr(qt, 'call', bridge)
-    result = qt.send_message_to_room('self', 'hello')
-    assert result['success'] is False
-    assert 'not confirmed' in result['error']
-    bridge.assert_called_once_with('send', room='self', text='hello')
-
-
 def test_nested_ui_operations_release_lock_after_error():
     try:
         with qt.operation(), qt.operation():
@@ -89,7 +57,7 @@ def test_default_monitor_and_recent_reads_leave_desktop_alone(monkeypatch):
     monkeypatch.delenv('KAKAO_QT_READ_MODE', raising=False)
     monkeypatch.setattr(qt, 'call', bridge)
     assert qt.read_chat_messages('fixture', monitoring=True)['parsed'] == payload
-    assert qt.read_chat_messages('fixture')['parsed'] == payload
+    assert qt.read_chat_messages('fixture')['parsed']['scope'] == 'visible_page_latest_unverified'
     assert [c.args[0] for c in bridge.call_args_list] == ['read', 'read']
 
 

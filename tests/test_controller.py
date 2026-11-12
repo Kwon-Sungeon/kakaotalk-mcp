@@ -256,10 +256,14 @@ def test_send_image_success(mock_abs, mock_isfile, mock_split, mock_find,
     mock_user32.GetForegroundWindow.side_effect = [11111, 33333, 33333]
     mock_win32gui.GetWindow.return_value = 11111
     controller.win32clipboard.GetClipboardSequenceNumber.return_value = mock_copy.return_value
-    with patch.object(controller, "_focus_control"), patch.object(controller, "_require_focus"):
+    with patch.object(controller, "_focus_control"), patch.object(controller, "_require_focus"), \
+            patch.object(controller, "_edit_text", return_value=""), \
+            patch.object(controller.bridge, "request", return_value={"sent": True, "confirmation": "verified_photo_preview_closed"}) as confirm:
         result = controller.send_image_to_room("TestRoom", "C:\\test\\image.jpg")
     assert result["success"] is True
     assert "sent" in result["message"].lower()
+    assert confirm.call_args.args[0]['action'] == 'legacy_image_confirm'
+    mock_user32.keybd_event.assert_not_called()
     mock_copy.assert_called_once()
     mock_bring.assert_called_once()
 

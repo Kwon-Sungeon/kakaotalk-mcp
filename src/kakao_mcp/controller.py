@@ -20,6 +20,7 @@ import win32process
 
 from . import config
 from .ui_lock import operation
+from .qt_bridge import bridge
 
 
 def _log(msg: str):
@@ -90,6 +91,9 @@ def list_chat_windows() -> List[Dict]:
     Returns list of dicts with hwnd and title.
     """
     main_hwnd = _main_window()
+    if not main_hwnd:
+        return []
+    pid = win32process.GetWindowThreadProcessId(main_hwnd)[1]
     windows: List[Dict] = []
 
     def _cb(hwnd, _):
@@ -98,6 +102,7 @@ def list_chat_windows() -> List[Dict]:
             title = win32gui.GetWindowText(hwnd)
             if (
                 cls == config.KAKAO_CHAT_WINDOW_CLASS
+                and win32process.GetWindowThreadProcessId(hwnd)[1] == pid
                 and hwnd != main_hwnd
                 and title
                 and title != config.KAKAO_MAIN_WINDOW_TITLE
@@ -365,7 +370,7 @@ def _read_clipboard_text(max_retries: int = None, interval_sec: float = None) ->
 # ---------------------------------------------------------------------------
 
 @operation()
-def send_message_to_room(room_name: str, text: str) -> Dict:
+def send_message_to_room(room_name: str, text: str, *, target=None) -> Dict:
     """Send a text message to a KakaoTalk chat room.
 
     Fill the native edit control directly, then focus it to send Enter.
@@ -374,37 +379,44 @@ def send_message_to_room(room_name: str, text: str) -> Dict:
     Returns:
         Dict with success (bool) and message or error.
     """
-    hwnd = find_chat_window(room_name)
+    if target:
+        target.verify()
+    hwnd = target.hwnd if target else find_chat_window(room_name)
     if hwnd is None:
         return {"success": False, "error": f"Chat window '{room_name}' not found"}
 
     edit_hwnd = find_child_window_recursive(hwnd, config.KAKAO_EDIT_CLASS)
     if edit_hwnd is None:
-        return {"success": False, "error": f"Edit control not found in '{room_name}'"}
+        return {"success": False, "status": "failed_before_send", "code": "input_not_found", "error": f"Edit control not found in '{room_name}'"}
 
     if _edit_text(edit_hwnd):
-        return {"success": False, "error": "Chat has an existing draft"}
+        return {"success": False, "status": "failed_before_send", "code": "draft_exists", "error": "Chat has an existing draft"}
 
+    if not win32gui.IsWindowEnabled(hwnd):
+        return {"success": False, "status": "failed_before_send", "code": "room_busy", "error": "Room has an open dialog"}
     expected = text.replace('\r\n', '\n').replace('\r', '\n')
     # EM_REPLACESEL goes to this Rich Edit and updates its change listeners.
     _replace_selection(edit_hwnd, expected.replace('\n', '\r\n'))
     draft = _edit_text(edit_hwnd)
     if not draft:
-        win32clipboard.OpenClipboard()
-        try:
-            win32clipboard.EmptyClipboard()
-            win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
-        finally:
-            win32clipboard.CloseClipboard()
-        win32gui.SendMessageTimeout(edit_hwnd, win32con.WM_PASTE, 0, 0, win32con.SMTO_ABORTIFHUNG, 1500)
+        # Target this edit even if the system clipboard changes to a file or photo.
+        buf = ctypes.create_unicode_buffer(expected.replace('\n', '\r\n'))
+        win32gui.SendMessageTimeout(edit_hwnd, win32con.WM_SETTEXT, 0, ctypes.addressof(buf),
+                                    win32con.SMTO_ABORTIFHUNG, 1500)
         draft = _edit_text(edit_hwnd)
     if draft != expected:
-        return {"success": False, "error": "Chat draft changed before send"}
+        return {"success": False, "status": "failed_before_send", "code": "draft_changed", "error": "Chat draft changed before send"}
 
+    return _submit_draft(room_name, hwnd, edit_hwnd, expected, target)
+
+
+def _submit_draft(room_name, hwnd, edit_hwnd, expected, target=None):
+    if target:
+        target.verify()
     button = _native_send_button(hwnd)
     if button:
         if find_chat_window(room_name) != hwnd or _edit_text(edit_hwnd) != expected:
-            return {"success": False, "error": "Chat draft changed before send"}
+            return {"success": False, "status": "failed_before_send", "code": "draft_changed", "error": "Chat draft changed before send"}
         win32gui.SendMessageTimeout(button, win32con.BM_CLICK, 0, 0, win32con.SMTO_ABORTIFHUNG, 1000)
         return _sent_when_cleared(edit_hwnd, room_name)
 
@@ -424,21 +436,27 @@ def send_message_to_room(room_name: str, text: str) -> Dict:
     bring_window_to_front(hwnd)
     _focus_control(hwnd, edit_hwnd)
     if _edit_text(edit_hwnd) != expected:
-        return {"success": False, "error": "Chat draft changed before send"}
+        return {"success": False, "status": "failed_before_send", "code": "draft_changed", "error": "Chat draft changed before send"}
     if find_chat_window(room_name) != hwnd:
         return {"success": False, "error": "Target room changed before send"}
     _require_focus(hwnd, edit_hwnd)
     send_key = os.environ.get('KAKAO_LEGACY_SEND_KEY', 'enter').lower()
     if send_key == 'ctrl_enter':
-        _send_ctrl_key_combo(config.VK_RETURN)
+        # With a nonstandard accelerator, invoke only this room's accessible button.
+        bridge.request(dict(action='legacy_send_button', room=room_name, hwnd=hwnd, qt=False,
+                            edit_hwnd=edit_hwnd, text=expected,
+                            process_id=win32process.GetWindowThreadProcessId(hwnd)[1]), 5)
     else:
-        _press_key(config.VK_RETURN)
+        # The application processes Enter through its message loop. Address the edit
+        # explicitly so a foreground switch cannot send into another application.
+        win32gui.PostMessage(edit_hwnd, win32con.WM_KEYDOWN, config.VK_RETURN, 0x001C0001)
+        win32gui.PostMessage(edit_hwnd, win32con.WM_KEYUP, config.VK_RETURN, 0xC01C0001)
     return _sent_when_cleared(edit_hwnd, room_name)
 
 
 def _sent_when_cleared(edit, room):
     if _wait_until(lambda: _edit_text(edit) == '', 2):
-        return {"success": True, "message": f"Message sent to '{room}'"}
+        return {"success": True, "confirmation": "draft_cleared", "message": f"Message sent to '{room}'"}
     return {"success": False, "error": "Send not confirmed: the draft did not clear. Check the room; "
             "do not retry automatically. If KakaoTalk uses Ctrl+Enter set KAKAO_LEGACY_SEND_KEY=ctrl_enter."}
 
@@ -448,60 +466,8 @@ def _sent_when_cleared(edit, room):
 # ---------------------------------------------------------------------------
 
 def send_bulk_messages(room_names: List[str], message: str, interval_sec: float = 0.5) -> Dict:
-    """Send the same message to multiple chat rooms sequentially.
-
-    Opens each room (if not already open) and sends the message.
-    Maintains a safe interval between rooms to avoid issues.
-
-    Args:
-        room_names: List of chat room names to send to.
-        message: The text message to send.
-        interval_sec: Seconds to wait between rooms (default 0.5, min 0.3).
-
-    Returns:
-        Dict with overall result and per-room details.
-    """
-    if not room_names:
-        return {"success": False, "error": "No room names provided"}
-    if not message.strip():
-        return {"success": False, "error": "Message cannot be empty"}
-
-    interval_sec = max(0.3, interval_sec)
-    results = []
-
-    for i, room_name in enumerate(room_names):
-        # Check if window is already open
-        hwnd = find_chat_window(room_name)
-
-        if hwnd is None:
-            # Need to search and open
-            open_result = search_and_open_room(room_name)
-            if not open_result["success"]:
-                results.append({
-                    "room": room_name,
-                    "success": False,
-                    "detail": open_result["error"],
-                })
-                continue
-
-        # Send message
-        send_result = send_message_to_room(room_name, message)
-        results.append({
-            "room": room_name,
-            "success": send_result["success"],
-            "detail": send_result.get("message") or send_result.get("error"),
-        })
-
-        # Wait between rooms (skip after last)
-        if i < len(room_names) - 1:
-            time.sleep(interval_sec)
-
-    sent_count = sum(1 for r in results if r["success"])
-    return {
-        "success": sent_count > 0,
-        "message": f"Sent to {sent_count}/{len(room_names)} room(s)",
-        "results": results,
-    }
+    from .delivery import deliver
+    return deliver('text', [(room, message) for room in room_names], interval=max(.3, interval_sec))
 
 
 # ---------------------------------------------------------------------------
@@ -581,7 +547,7 @@ def temporary_image_clipboard(file_path):
 
 
 @operation()
-def send_image_to_room(room_name: str, image_path: str) -> Dict:
+def send_image_to_room(room_name: str, image_path: str, *, target=None) -> Dict:
     """Send an image file to a KakaoTalk chat room.
 
     Copies the image to clipboard as bitmap data (CF_DIB), pastes via
@@ -599,14 +565,18 @@ def send_image_to_room(room_name: str, image_path: str) -> Dict:
             "error": f"Unsupported image format '{ext}'. Supported: {', '.join(sorted(config.SUPPORTED_IMAGE_EXTENSIONS))}",
         }
 
-    hwnd = find_chat_window(room_name)
+    if target:
+        target.verify()
+    hwnd = target.hwnd if target else find_chat_window(room_name)
     if hwnd is None:
         return {"success": False, "error": f"Chat window '{room_name}' not found"}
 
     edit_hwnd = find_child_window_recursive(hwnd, config.KAKAO_EDIT_CLASS)
     if edit_hwnd is None:
-        return {"success": False, "error": f"Edit control not found in '{room_name}'"}
+        return {"success": False, "status": "failed_before_send", "code": "input_not_found", "error": f"Edit control not found in '{room_name}'"}
 
+    if _edit_text(edit_hwnd):
+        return {"success": False, "status": "failed_before_send", "code": "draft_exists", "error": "Chat has an existing draft"}
     try:
         with temporary_image_clipboard(abs_path) as sequence:
             return _send_prepared_image(hwnd, edit_hwnd, sequence, room_name, abs_path)
@@ -615,64 +585,25 @@ def send_image_to_room(room_name: str, image_path: str) -> Dict:
 
 
 def _send_prepared_image(hwnd, edit_hwnd, sequence, room_name, abs_path):
+    # Require a new preview. An existing modal must never receive paste or Enter.
+    if not win32gui.IsWindowEnabled(hwnd) or find_chat_window(room_name) != hwnd:
+        return {"success": False, "status": "failed_before_send", "error": "Room changed or has an open dialog"}
+    pid = win32process.GetWindowThreadProcessId(hwnd)[1]
     bring_window_to_front(hwnd)
-    time.sleep(config.IMAGE_FOCUS_WAIT_SEC)
     _focus_control(hwnd, edit_hwnd)
     _require_focus(hwnd, edit_hwnd)
-    if win32clipboard.GetClipboardSequenceNumber() != sequence:
-        return {"success": False, "error": "Clipboard image changed"}
-    _send_ctrl_key_combo(0x56)
-
-    # Wait for the confirmation dialog to appear (it's a separate window).
-    # Poll until foreground changes from the chat window or timeout.
-    dialog_hwnd = None
-    for _ in range(40):  # up to ~6 seconds
-        time.sleep(config.IMAGE_DIALOG_POLL_INTERVAL_SEC)
-        fg = _user32.GetForegroundWindow()
-        if fg and win32gui.GetWindow(fg, win32con.GW_OWNER) == hwnd and fg != hwnd:
-            dialog_hwnd = fg
-            break
-
-    if dialog_hwnd is None:
-        _log("Image send dialog did not appear")
-        return {"success": False, "error": "Image send confirmation dialog did not appear"}
-
-    # The dialog is already the foreground window.  Give it time to fully
-    # render, then press Enter to confirm.
-    time.sleep(config.IMAGE_CONFIRM_WAIT_SEC)
-    if (_user32.GetForegroundWindow() != dialog_hwnd
-            or win32gui.GetWindow(dialog_hwnd, win32con.GW_OWNER) != hwnd):
-        return {"success": False, "error": "Image preview lost focus or changed owner"}
-    _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
-    time.sleep(0.05)
-    _user32.keybd_event(config.VK_RETURN, 0, config.KEYEVENTF_KEYUP, 0)
-    time.sleep(config.IMAGE_AFTER_CONFIRM_WAIT_SEC)
-
-    return {"success": True, "message": f"Image sent to '{room_name}': {os.path.basename(abs_path)}"}
+    if win32clipboard.GetClipboardSequenceNumber() != sequence or _edit_text(edit_hwnd):
+        return {"success": False, "status": "failed_before_send", "error": "Clipboard or draft changed"}
+    win32gui.PostMessage(edit_hwnd, win32con.WM_PASTE, 0, 0)
+    result = bridge.request(dict(action='legacy_image_confirm', room=room_name, hwnd=hwnd,
+                                 process_id=pid, qt=False), 10)
+    return {"success": result['sent'], "confirmation": result['confirmation'],
+            "message": f"Image sent to '{room_name}'"}
 
 
 def send_images_to_room(room_name: str, image_paths: List[str]) -> Dict:
-    """Send multiple image files to a KakaoTalk chat room, one at a time."""
-    if not image_paths:
-        return {"success": False, "error": "No image paths provided"}
-
-    results = []
-    for i, path in enumerate(image_paths):
-        result = send_image_to_room(room_name, path)
-        results.append({
-            "path": path,
-            "success": result["success"],
-            "detail": result.get("message") or result.get("error"),
-        })
-        if i < len(image_paths) - 1 and result["success"]:
-            time.sleep(config.IMAGE_BETWEEN_SEND_WAIT_SEC)
-
-    sent_count = sum(1 for r in results if r["success"])
-    return {
-        "success": sent_count > 0,
-        "message": f"Sent {sent_count}/{len(image_paths)} image(s) to '{room_name}'",
-        "results": results,
-    }
+    from .delivery import deliver
+    return deliver('image', [(room_name, path) for path in image_paths])
 
 
 # ---------------------------------------------------------------------------
@@ -882,12 +813,13 @@ def search_and_open_room(room_name: str) -> Dict:
     _replace_selection(edit_hwnd, room_name)
     if _edit_text(edit_hwnd) != room_name:
         return {"success": False, "error": "Could not verify exact room search text"}
-    # A custom list can keep showing the previous query while it refreshes.
-    time.sleep(config.SEARCH_RESULTS_WAIT_SEC)
-    _require_focus(main_hwnd, edit_hwnd)
-    if _edit_text(edit_hwnd) != room_name:
-        return {"success": False, "error": "Search text changed"}
-    _press_key(config.VK_RETURN)
+    view = _find_chat_list_view(main_hwnd)
+    results = _wait_until(lambda: _find_visible_search_list(view), 2) if view else None
+    if not results or _edit_text(edit_hwnd) != room_name:
+        return {"success": False, "code": "room_not_verified", "error": "Cannot identify search results; open the exact room manually"}
+    bridge.request(dict(action='legacy_open_result', room=room_name, hwnd=main_hwnd,
+                        list_hwnd=results, edit_hwnd=edit_hwnd,
+                        process_id=win32process.GetWindowThreadProcessId(main_hwnd)[1]), 8)
     hwnd = _wait_until(lambda: find_chat_window(room_name), 3)
     if hwnd:
         return {"success": True, "message": f"Opened chat room '{room_name}'", "hwnd": hwnd}
@@ -898,28 +830,19 @@ def search_and_open_room(room_name: str) -> Dict:
     }
 
 
-def _find_visible_search_list(main_hwnd: int) -> Optional[int]:
-    """Find the visible SearchListCtrl in the main window."""
-    result = None
+def _find_visible_search_list(view: int) -> Optional[int]:
+    """Accept only the unique visible results list inside the active Chats view."""
+    matches = []
 
-    def _cb(hwnd, _):
-        nonlocal result
-        cls = win32gui.GetClassName(hwnd)
-        text = win32gui.GetWindowText(hwnd)
-        if cls == "EVA_VH_ListControl_Dblclk" and "SearchListCtrl" in text:
-            r = win32gui.GetWindowRect(hwnd)
-            w = r[2] - r[0]
-            h = r[3] - r[1]
-            if w > 100 and h > 100:
-                result = hwnd
-                return False
+    def visit(hwnd, _):
+        if (win32gui.IsWindowVisible(hwnd) and win32gui.IsWindowEnabled(hwnd)
+                and win32gui.GetClassName(hwnd) == config.KAKAO_LIST_CONTROL_CLASS
+                and "SearchListCtrl" in win32gui.GetWindowText(hwnd)):
+            matches.append(hwnd)
         return True
 
-    try:
-        win32gui.EnumChildWindows(main_hwnd, _cb, None)
-    except Exception:
-        pass
-    return result
+    win32gui.EnumChildWindows(view, visit, None)
+    return matches[0] if len(matches) == 1 else None
 
 
 # ---------------------------------------------------------------------------
@@ -1114,77 +1037,32 @@ def _decompose_korean(text: str) -> List[tuple]:
 # ---------------------------------------------------------------------------
 
 @operation()
-def send_mention_message(room_name: str, mention_name: str, message: str) -> Dict:
-    """Send a message with @mention to a KakaoTalk chat room.
-
-    Uses keybd_event to type '@' (Shift+2) which activates the mention popup,
-    then types the name using Korean 2벌식 keyboard simulation, selects the
-    mention with Enter, and pastes the message text via clipboard.
-
-    NOTE: This briefly brings the chat window to the foreground.
-
-    Args:
-        room_name: Exact title of the chat room window.
-        mention_name: Display name of the person to mention.
-        message: Text message to send after the mention.
-
-    Returns:
-        Dict with success (bool) and message or error.
-    """
-    hwnd = find_chat_window(room_name)
-    if hwnd is None:
-        return {"success": False, "error": f"Chat window '{room_name}' not found"}
-
-    edit_hwnd = find_child_window_recursive(hwnd, config.KAKAO_EDIT_CLASS)
-    if edit_hwnd is None:
-        return {"success": False, "error": f"Edit control not found in '{room_name}'"}
-
-    # Clear the edit control
-    EM_SETSEL = 0x00B1
-    WM_CLEAR = 0x0303
-    win32api.SendMessage(edit_hwnd, EM_SETSEL, 0, -1)
-    win32api.SendMessage(edit_hwnd, WM_CLEAR, 0, 0)
-
-    # Bring window to foreground and click on edit control for focus
+def send_mention_message(room_name: str, mention_name: str, message: str, *, target=None) -> Dict:
+    """Select an exposed exact mention candidate before submitting the verified draft."""
+    if target:
+        target.verify()
+    hwnd = target.hwnd if target else find_chat_window(room_name)
+    edit = find_child_window_recursive(hwnd, config.KAKAO_EDIT_CLASS) if hwnd else None
+    if not edit:
+        return {"success": False, "status": "failed_before_send", "error": "Target chat input not found"}
+    if _edit_text(edit):
+        return {"success": False, "status": "failed_before_send", "code": "draft_exists", "error": "Chat has an existing draft"}
     bring_window_to_front(hwnd)
-    time.sleep(config.MENTION_FOCUS_WAIT_SEC)
-    _focus_control(hwnd, edit_hwnd)
-
-    # Type '@' using Shift+2 (keybd_event required to activate mention popup)
+    _focus_control(hwnd, edit)
+    _require_focus(hwnd, edit)
     _press_key(0x32, shift=True)
     time.sleep(config.MENTION_AT_WAIT_SEC)
-
-    # Type mention name using Korean 2벌식 keyboard simulation
-    keys = _decompose_korean(mention_name)
-    for vk, shift in keys:
-        _require_focus(hwnd, edit_hwnd)
+    for vk, shift in _decompose_korean(mention_name):
+        _require_focus(hwnd, edit)
         _press_key(vk, shift=shift)
-    time.sleep(config.MENTION_NAME_WAIT_SEC)
-
-    # Press Enter to select the mention from the popup
-    _require_focus(hwnd, edit_hwnd)
-    _press_key(config.VK_RETURN)
-    time.sleep(config.MENTION_SELECT_WAIT_SEC)
-
-    # Paste message text via clipboard (space prefix to separate from mention)
-    win32clipboard.OpenClipboard()
-    win32clipboard.EmptyClipboard()
-    win32clipboard.SetClipboardText(' ' + message, win32clipboard.CF_UNICODETEXT)
-    win32clipboard.CloseClipboard()
-    time.sleep(config.CLIPBOARD_PASTE_WAIT_SEC)
-    _require_focus(hwnd, edit_hwnd)
-    _send_ctrl_key_combo(0x56)  # Ctrl+V
-    time.sleep(config.MENTION_PASTE_WAIT_SEC)
-
-    # Press Enter to send the message
-    _require_focus(hwnd, edit_hwnd)
-    _press_key(config.VK_RETURN)
-    time.sleep(config.MENTION_SEND_WAIT_SEC)
-
-    return {
-        "success": True,
-        "message": f"Mention message sent to @{mention_name} in '{room_name}'",
-    }
+    pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+    bridge.request(dict(action='legacy_select_mention', hwnd=hwnd, process_id=pid, qt=False,
+                        room=room_name, mention=mention_name), 8)
+    prefix = '@' + mention_name + ' '
+    if not _wait_until(lambda: _edit_text(edit) == prefix, 1.5):
+        return {"success": False, "status": "failed_before_send", "error": "Selected mention token not verified"}
+    _replace_selection(edit, message)
+    return _submit_draft(room_name, hwnd, edit, prefix + message, target)
 
 
 # ---------------------------------------------------------------------------

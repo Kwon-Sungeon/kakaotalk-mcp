@@ -44,8 +44,12 @@ def call(action, **arguments):
         pids = {pid for pid, _, _ in _qt_windows()}
         if len(pids) != 1:
             raise RuntimeError(f'Expected one accessible Qt KakaoTalk process on this desktop, found {len(pids)}')
-        timeout = max(45, 15 * arguments.get('limit', 1)) if action == 'download' else 45
-        return bridge.request({'action': action, 'process_id': pids.pop(), **arguments}, timeout)
+        timeout = max(45, 15 * arguments.get('limit', 1)) if action == 'download' else (
+            10 if action in {'health', 'rooms', 'read'} else 20)
+        pid = pids.pop()
+        if arguments.get('process_id', pid) != pid:
+            raise RuntimeError('Target room process changed')
+        return bridge.request({'action': action, 'process_id': pid, **arguments}, timeout)
 
 
 def available():
@@ -80,17 +84,12 @@ def search_and_open_room(room_name):
         data = call('open', room=room_name)
         return {'success': True, 'message': f"Opened '{room_name}'", **data}
     except Exception as error:
-        return {'success': False, 'error': str(error)}
+        return {'success': False, 'code': getattr(error, 'code', 'room_not_verified'), 'error': str(error)}
 
 
 def send_message_to_room(room_name, text):
-    try:
-        if not text.strip():
-            raise ValueError('Message cannot be empty')
-        call('send', room=room_name, text=text)
-        return {'success': True, 'message': f"Sent message to '{room_name}'"}
-    except Exception as error:
-        return {'success': False, 'error': str(error)}
+    from .delivery import deliver
+    return deliver('text', [(room_name, text)])
 
 
 def read_chat_messages(room_name, read_mode=None, max_messages=None, *, monitoring=False, all_history=False):
@@ -109,12 +108,11 @@ def read_chat_messages(room_name, read_mode=None, max_messages=None, *, monitori
             # A request for all links/history needs the full local copy. A
             # bounded read can use the exposed tail when it has enough detail.
             if mode == 'auto' and not all_history:
-                try:
-                    exposed = call('read', room=room_name)
-                except (RuntimeError, subprocess.TimeoutExpired):
-                    pass
+                exposed = call('read', room=room_name)
                 messages = exposed.get('messages', [])
                 if max_messages is None and messages and exposed.get('at_end') is not False:
+                    if exposed.get('at_end') is None:
+                        exposed = {**exposed, 'scope': 'visible_page_latest_unverified'}
                     return {'success': True, 'parsed': exposed}
                 tail = messages[-max_messages:] if max_messages else []
                 if (exposed.get('at_end') and len(tail) == max_messages
@@ -122,7 +120,8 @@ def read_chat_messages(room_name, read_mode=None, max_messages=None, *, monitori
                     return {'success': True, 'parsed': exposed}
             from .parser import parse_chat_text
             snapshot = legacy._plain_clipboard_snapshot()
-            copied = call('copy', room=room_name)
+            pin = {key: exposed[key] for key in ('hwnd', 'process_id') if key in exposed}
+            copied = call('copy', room=room_name, **pin)
             legacy._restore_plain_clipboard(snapshot, copied.get('before_copy'), copied.get('after_copy'))
             raw = copied['raw_text']
             parsed = parse_chat_text(raw)
@@ -134,57 +133,23 @@ def read_chat_messages(room_name, read_mode=None, max_messages=None, *, monitori
             parsed['unknown_fields'] = ['member_count'] if parsed['member_count'] is None else []
             return {'success': True, 'parsed': parsed}
     except Exception as error:
-        if mode == 'auto' and exposed.get('messages'):
+        code = getattr(error, 'code', 'read_failed')
+        if mode == 'auto' and exposed.get('messages') and code not in {'room_changed', 'room_not_found', 'room_ambiguous'}:
             return {'success': True, 'parsed': {**exposed, 'partial': True, 'detail_error': str(error)}}
-        return {'success': False, 'error': str(error), 'raw_text': ''}
+        return {'success': False, 'code': code, 'error': str(error), 'raw_text': ''}
 
 
-def send_bulk_messages(room_names, message, interval_sec=.5):
-    if not room_names or not message.strip():
-        return {'success': False, 'error': 'Rooms and a nonempty message are required', 'results': []}
-    results = []
-    for index, name in enumerate(room_names):
-        opened = search_and_open_room(name)
-        result = send_message_to_room(name, message) if opened['success'] else opened
-        results.append({'room': name, 'success': result['success'], 'detail': result.get('message') or result.get('error')})
-        if index < len(room_names) - 1:
-            time.sleep(max(.3, interval_sec))
-    count = sum(r['success'] for r in results)
-    return {'success': count > 0, 'message': f'Sent to {count}/{len(results)} room(s)', 'results': results}
+send_bulk_messages = legacy.send_bulk_messages
+send_images_to_room = legacy.send_images_to_room
 
 
 def send_image_to_room(room_name, image_path):
     return send_images_to_room(room_name, [image_path])
 
 
-def send_images_to_room(room_name, image_paths):
-    from .config import SUPPORTED_IMAGE_EXTENSIONS
-    paths = [Path(path).resolve() for path in image_paths]
-    if not paths or any(not p.is_file() or p.suffix.lower() not in SUPPORTED_IMAGE_EXTENSIONS for p in paths):
-        return {'success': False, 'error': 'All paths must be existing supported image files', 'results': []}
-    results = []
-    try:
-        with operation():
-            hwnd = find_chat_window(room_name)
-            if hwnd is None:
-                raise ValueError('Target room is not open')
-            for path in paths:
-                with legacy.temporary_image_clipboard(str(path)) as sequence:
-                    data = call('image', room=room_name, hwnd=hwnd, sequence=sequence)
-                results.append({'path': str(path), **data})
-        return {'success': True, 'message': f"Sent {len(paths)} image(s) to '{room_name}'", 'results': results}
-    except Exception as error:
-        return {'success': False, 'error': str(error), 'results': results}
-
-
 def send_mention_message(room_name, mention_name, message):
-    if not mention_name.strip() or not message.strip():
-        return {'success': False, 'error': 'Mention name and message are required'}
-    try:
-        call('mention', room=room_name, mention=mention_name, text=message)
-        return {'success': True, 'message': f"Sent mention to @{mention_name} in '{room_name}'"}
-    except Exception as error:
-        return {'success': False, 'error': str(error)}
+    from .delivery import deliver
+    return deliver('mention', [(room_name, message)], mention=mention_name)
 
 
 def download_recent_images(room_name, output_dir, max_images=10):
