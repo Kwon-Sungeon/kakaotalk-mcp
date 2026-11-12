@@ -1,17 +1,17 @@
 #!/usr/bin/env python
-"""MCP Server for KakaoTalk PC automation via Win32 API."""
+"""MCP Server for KakaoTalk PC automation via Windows UI Automation or Win32."""
 import os
 from typing import Dict, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from kakao_mcp import controller
+from kakao_mcp import backend as controller
 from kakao_mcp import parser
 from kakao_mcp import config
 
 app = FastMCP(
     "kakao-mcp-server",
-    instructions="MCP Server for KakaoTalk PC automation via Win32 API",
+    instructions="MCP Server for KakaoTalk PC automation via Windows UI Automation or Win32",
 )
 
 
@@ -111,7 +111,7 @@ def kakao_send_bulk(room_names: list[str], message: str, interval_sec: float = 0
         result = controller.send_bulk_messages(room_names, message, interval_sec)
         if result["success"]:
             return {"message": result["message"], "results": result["results"]}
-        return {"error": result.get("message", "Failed to send bulk messages"), "results": result.get("results", [])}
+        return {"error": result.get("error") or result.get("message", "Failed to send bulk messages"), "results": result.get("results", [])}
     except Exception as e:
         return {"error": f"Failed to send bulk messages: {e}"}
 
@@ -119,7 +119,7 @@ def kakao_send_bulk(room_names: list[str], message: str, interval_sec: float = 0
 @app.tool()
 def kakao_send_image(room_name: str, image_paths: list[str]) -> Dict:
     """Send image file(s) to a KakaoTalk chat room.
-    Copies the image to clipboard using file-drop format and pastes into the chat.
+    Copies the image to clipboard as bitmap data and pastes into the chat.
     KakaoTalk shows a confirmation dialog which is automatically accepted.
     The chat room window must already be open.
     NOTE: This briefly brings the chat window to the foreground.
@@ -145,7 +145,7 @@ def kakao_send_image(room_name: str, image_paths: list[str]) -> Dict:
             result = controller.send_images_to_room(room_name, image_paths)
             if result["success"]:
                 return {"message": result["message"], "results": result["results"]}
-            return {"error": result.get("message", "Failed to send images"), "results": result.get("results", [])}
+            return {"error": result.get("error") or result.get("message", "Failed to send images"), "results": result.get("results", [])}
     except Exception as e:
         return {"error": f"Failed to send image: {e}"}
 
@@ -153,18 +153,22 @@ def kakao_send_image(room_name: str, image_paths: list[str]) -> Dict:
 @app.tool()
 def kakao_read_messages(room_name: str, max_messages: int = 50) -> Dict:
     """Read recent messages from a KakaoTalk chat room.
-    Uses clipboard-based reading (Ctrl+A, Ctrl+C on the chat list).
-    NOTE: This briefly brings the chat window to the foreground.
+    Reads locally loaded messages using the selected UI backend.
+    Qt complete mode uses UIA-targeted copy to retain sender/time metadata.
+    KAKAO_QT_READ_MODE=uia reads exposed UIA messages without clipboard/focus.
+    partial indicates that server-only history may not be included.
 
     Args:
         room_name: Exact title of the chat room window.
         max_messages: Maximum number of recent messages to return (default 50).
     """
     try:
+        if max_messages < 1:
+            return {"error": "max_messages must be positive"}
         result = controller.read_chat_messages(room_name)
         if not result["success"]:
             return {"error": result["error"]}
-        parsed = parser.parse_chat_text(result["raw_text"])
+        parsed = result.get('parsed') or parser.parse_chat_text(result["raw_text"])
         messages = parsed["messages"]
         if len(messages) > max_messages:
             messages = messages[-max_messages:]
@@ -173,6 +177,8 @@ def kakao_read_messages(room_name: str, max_messages: int = 50) -> Dict:
             "room_name": parsed["room_name"],
             "member_count": parsed["member_count"],
             "messages": messages,
+            "partial": parsed.get("partial", False),
+            "read_method": parsed.get("read_method", "clipboard"),
         }
     except Exception as e:
         return {"error": f"Failed to read messages: {e}"}
@@ -190,11 +196,12 @@ def kakao_extract_links(room_name: str) -> Dict:
         result = controller.read_chat_messages(room_name)
         if not result["success"]:
             return {"error": result["error"]}
-        parsed = parser.parse_chat_text(result["raw_text"])
+        parsed = result.get('parsed') or parser.parse_chat_text(result["raw_text"])
         urls = parser.extract_urls_from_messages(parsed["messages"])
         return {
             "message": f"Found {len(urls)} URL(s) in '{room_name}'",
             "links": urls,
+            "partial": parsed.get("partial", False),
         }
     except Exception as e:
         return {"error": f"Failed to extract links: {e}"}
@@ -231,12 +238,13 @@ def kakao_download_images(
     output_dir: Optional[str] = None,
     max_images: int = 10,
 ) -> Dict:
-    """Download recent images from KakaoTalk's local cache.
-    Images are sorted by modification time (newest first).
-    Note: Cache is global, not per-room — images are the most recently cached ones.
+    """Download recent KakaoTalk images.
+    Legacy: copy account-wide cached images, sorted newest first.
+    Qt saves photos exposed by the named room through its photo viewer.
+    scope indicates visible or scrollable loaded room photos; partial is true.
 
     Args:
-        room_name: Chat room name (for context/logging).
+        room_name: Exact room title for Qt, or a room label for the legacy cache.
         output_dir: Directory to save images. Defaults to Documents/KakaoMCP_Images.
         max_images: Maximum number of images to download (default 10).
     """

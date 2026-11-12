@@ -107,9 +107,21 @@ def test_list_chat_windows(mock_gui):
 def test_send_message_success(mock_find, mock_child, mock_api):
     mock_find.return_value = 11111
     mock_child.return_value = 22222
-    result = controller.send_message_to_room("TestRoom", "Hello")
+    # These are mocks supplied by the autouse fixture, never native Win32 IO.
+    from unittest.mock import Mock
+    assert isinstance(controller._user32, Mock)
+    assert isinstance(controller.win32clipboard, Mock)
+    from contextlib import ExitStack
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(controller, '_edit_text', side_effect=['', 'Hello']))
+        stack.enter_context(patch.object(controller, '_click_control'))
+        stack.enter_context(patch.object(controller, '_require_focus'))
+        result = controller.send_message_to_room("TestRoom", "Hello")
     assert result["success"] is True
     assert "sent" in result["message"].lower()
+    controller.win32clipboard.SetClipboardText.assert_called_once_with(
+        "Hello", controller.win32clipboard.CF_UNICODETEXT
+    )
 
 
 @patch("kakao_mcp.controller.find_chat_window")
@@ -145,7 +157,8 @@ def test_read_messages_success(mock_find, mock_child, mock_gui, mock_user32, moc
     mock_child.return_value = 33333
     mock_gui.GetWindowRect.return_value = (0, 0, 100, 100)
     mock_clip.return_value = "[Room] [대화상대 2명]\n[A] [오전 10:00] Hello"
-    result = controller.read_chat_messages("Room")
+    with patch.object(controller, "_click_control"), patch.object(controller, "_require_focus"):
+        result = controller.read_chat_messages("Room")
     assert result["success"] is True
     assert "Hello" in result["raw_text"]
 
@@ -196,6 +209,7 @@ def test_copy_image_to_clipboard_success(mock_abs, mock_isfile, mock_subprocess,
                                           mock_clipboard):
     # Fake BMP data: 14-byte file header + 40-byte info header + pixel data
     fake_bmp = b"BM" + b"\x00" * 12 + b"\x00" * 40 + b"\xff" * 100
+    mock_clipboard.GetClipboardData.return_value = fake_bmp[14:]
     mock_result = mock_subprocess.run.return_value
     mock_result.returncode = 0
     mock_result.stdout = fake_bmp
@@ -203,7 +217,8 @@ def test_copy_image_to_clipboard_success(mock_abs, mock_isfile, mock_subprocess,
     mock_subprocess.run.assert_called_once()
     call_args = mock_subprocess.run.call_args[0][0]
     assert call_args[0] == "powershell"
-    mock_clipboard.OpenClipboard.assert_called_once()
+    assert mock_clipboard.OpenClipboard.call_count == 2
+    assert mock_clipboard.CloseClipboard.call_count == 2
     mock_clipboard.EmptyClipboard.assert_called_once()
     mock_clipboard.SetClipboardData.assert_called_once()
 
@@ -236,8 +251,10 @@ def test_send_image_success(mock_abs, mock_isfile, mock_split, mock_find,
     mock_find_child.return_value = 22222
     mock_win32gui.GetWindowRect.return_value = (100, 100, 200, 120)
     # Simulate dialog appearing (foreground changes to a different window)
-    mock_user32.GetForegroundWindow.side_effect = [11111, 33333]
-    result = controller.send_image_to_room("TestRoom", "C:\\test\\image.jpg")
+    mock_user32.GetForegroundWindow.side_effect = [11111, 33333, 33333]
+    mock_win32gui.GetWindow.return_value = 11111
+    with patch.object(controller, "_require_focus"):
+        result = controller.send_image_to_room("TestRoom", "C:\\test\\image.jpg")
     assert result["success"] is True
     assert "sent" in result["message"].lower()
     mock_copy.assert_called_once()
@@ -269,3 +286,15 @@ def test_send_image_room_not_found(mock_find, mock_abs, mock_isfile, mock_split)
     result = controller.send_image_to_room("NoRoom", "C:\\test\\image.jpg")
     assert result["success"] is False
     assert "not found" in result["error"]
+
+def test_wrong_foreground_cannot_paste_or_send():
+    controller.win32gui.GetWindowRect.return_value = (0, 0, 50, 50)
+    controller._user32.GetForegroundWindow.return_value = 33333
+    with patch.object(controller, 'find_chat_window', return_value=11111), \
+            patch.object(controller, 'find_child_window_recursive', return_value=22222), \
+            patch.object(controller, 'bring_window_to_front'), \
+            pytest.raises(RuntimeError, match='inactive'):
+        controller.send_message_to_room('TestRoom', 'sample')
+    controller.win32clipboard.OpenClipboard.assert_not_called()
+    controller._user32.keybd_event.assert_not_called()
+    controller._user32.mouse_event.assert_not_called()

@@ -61,12 +61,17 @@ def parse_chat_text(raw_text: str) -> Dict:
     # Extract messages
     lines = raw_text.split('\n')
     current_message = None
+    date = None
 
     for line in lines:
         stripped = line.strip()
 
         # Skip empty lines and date separators
-        if not stripped or DATE_SEPARATOR_PATTERN.match(stripped):
+        separator = DATE_SEPARATOR_PATTERN.match(stripped)
+        if separator:
+            date = separator.group(1)
+            continue
+        if not stripped:
             continue
 
         # Skip header line
@@ -80,6 +85,7 @@ def parse_chat_text(raw_text: str) -> Dict:
                 _finalize_message(current_message, result["messages"])
 
             current_message = {
+                "date": date,
                 "sender": msg_match.group(1),
                 "time": f"{msg_match.group(2)} {msg_match.group(3)}",
                 "text": msg_match.group(4),

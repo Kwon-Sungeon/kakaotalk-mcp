@@ -3,11 +3,11 @@ import os
 import sys
 import time
 import ctypes
+from ctypes import wintypes
 import shutil
-import hashlib
 import subprocess
 import threading
-from collections import deque
+from collections import Counter, deque
 from typing import Optional, List, Dict
 
 import win32gui
@@ -59,6 +59,8 @@ def find_chat_window(room_name: str) -> Optional[int]:
         return True
 
     win32gui.EnumWindows(_cb, None)
+    if len(results) > 1:
+        raise ValueError(f"Multiple open rooms named {room_name!r}")
     return results[0] if results else None
 
 
@@ -152,6 +154,46 @@ def bring_window_to_front(hwnd: int):
 _user32 = ctypes.windll.user32
 
 
+class _GuiThreadInfo(ctypes.Structure):
+    _fields_ = [
+        ('cbSize', wintypes.DWORD), ('flags', wintypes.DWORD),
+        ('hwndActive', wintypes.HWND), ('hwndFocus', wintypes.HWND),
+        ('hwndCapture', wintypes.HWND), ('hwndMenuOwner', wintypes.HWND),
+        ('hwndMoveSize', wintypes.HWND), ('hwndCaret', wintypes.HWND),
+        ('rcCaret', wintypes.RECT),
+    ]
+
+
+def _require_focus(window, control):
+    info = _GuiThreadInfo()
+    info.cbSize = ctypes.sizeof(info)
+    if (not _user32.GetGUIThreadInfo(0, ctypes.byref(info))
+            or info.hwndActive != window or info.hwndFocus != control
+            or _user32.GetForegroundWindow() != window):
+        raise RuntimeError("KakaoTalk target lost keyboard focus")
+
+
+def _edit_text(control):
+    length = win32gui.SendMessage(control, win32con.WM_GETTEXTLENGTH, 0, 0)
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    win32gui.SendMessage(control, win32con.WM_GETTEXT, len(buffer), ctypes.addressof(buffer))
+    return buffer.value.replace('\r\n', '\n').replace('\r', '\n')
+
+
+def _click_control(window, control):
+    left, top, right, bottom = win32gui.GetWindowRect(control)
+    point = ((left + right) // 2, (top + bottom) // 2)
+    if _user32.GetForegroundWindow() != window or win32gui.WindowFromPoint(point) != control:
+        raise RuntimeError("KakaoTalk target control is covered or inactive")
+    _user32.SetCursorPos(*point)
+    if win32gui.GetCursorPos() != point or win32gui.WindowFromPoint(point) != control:
+        raise RuntimeError("KakaoTalk target moved before click")
+    _user32.mouse_event(2, 0, 0, 0, 0)
+    _user32.mouse_event(4, 0, 0, 0, 0)
+    time.sleep(config.EDIT_CLICK_WAIT_SEC)
+    _require_focus(window, control)
+
+
 def _press_key(vk: int, shift: bool = False):
     """Press and release a single key via keybd_event, optionally with Shift."""
     VK_SHIFT = 0x10
@@ -228,26 +270,25 @@ def send_message_to_room(room_name: str, text: str) -> Dict:
     time.sleep(config.WINDOW_ACTIVATE_WAIT_SEC)
 
     # Click on the edit control to ensure focus
-    try:
-        rect = win32gui.GetWindowRect(edit_hwnd)
-        cx = (rect[0] + rect[2]) // 2
-        cy = (rect[1] + rect[3]) // 2
-        _user32.SetCursorPos(cx, cy)
-        _user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
-        _user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
-        time.sleep(config.EDIT_CLICK_WAIT_SEC)
-    except Exception:
-        pass
+    _click_control(hwnd, edit_hwnd)
 
     # Paste text via clipboard (handles Korean correctly, unlike WM_SETTEXT on some versions)
+    if _edit_text(edit_hwnd):
+        return {"success": False, "error": "Chat has an existing draft"}
     win32clipboard.OpenClipboard()
-    win32clipboard.EmptyClipboard()
-    win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
-    win32clipboard.CloseClipboard()
+    try:
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardText(text, win32clipboard.CF_UNICODETEXT)
+    finally:
+        win32clipboard.CloseClipboard()
     time.sleep(config.CLIPBOARD_PASTE_WAIT_SEC)
-    _send_ctrl_key_combo(0x56)  # Ctrl+V
+    _require_focus(hwnd, edit_hwnd)
+    win32api.SendMessage(edit_hwnd, win32con.WM_PASTE, 0, 0)
     time.sleep(config.AFTER_PASTE_WAIT_SEC)
+    if _edit_text(edit_hwnd) != text.replace('\r\n', '\n').replace('\r', '\n'):
+        return {"success": False, "error": "Chat draft changed before send"}
 
+    _require_focus(hwnd, edit_hwnd)
     # Press Enter using keybd_event (not WM_KEYDOWN — WM_KEYDOWN inserts newline in RICHEDIT)
     _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
     _user32.keybd_event(config.VK_RETURN, 0, config.KEYEVENTF_KEYUP, 0)
@@ -284,7 +325,6 @@ def send_bulk_messages(room_names: List[str], message: str, interval_sec: float 
     for i, room_name in enumerate(room_names):
         # Check if window is already open
         hwnd = find_chat_window(room_name)
-        actual_room_name = room_name
 
         if hwnd is None:
             # Need to search and open
@@ -296,14 +336,11 @@ def send_bulk_messages(room_names: List[str], message: str, interval_sec: float 
                     "detail": open_result["error"],
                 })
                 continue
-            # Extract actual room name from open result message
-            actual_room_name = open_result.get("message", "").split("'")[1] if "'" in open_result.get("message", "") else room_name
-            hwnd = open_result.get("hwnd")
 
         # Send message
-        send_result = send_message_to_room(actual_room_name, message)
+        send_result = send_message_to_room(room_name, message)
         results.append({
-            "room": actual_room_name,
+            "room": room_name,
             "success": send_result["success"],
             "detail": send_result.get("message") or send_result.get("error"),
         })
@@ -372,6 +409,14 @@ def _copy_image_to_clipboard(file_path: str):
         win32clipboard.SetClipboardData(win32con.CF_DIB, dib_data)
     finally:
         win32clipboard.CloseClipboard()
+    # Closing the clipboard can synthesize formats and advance its sequence.
+    win32clipboard.OpenClipboard()
+    try:
+        if win32clipboard.GetClipboardData(win32con.CF_DIB) != dib_data:
+            raise RuntimeError("Clipboard image changed")
+        return win32clipboard.GetClipboardSequenceNumber()
+    finally:
+        win32clipboard.CloseClipboard()
 
 
 def send_image_to_room(room_name: str, image_path: str) -> Dict:
@@ -424,6 +469,7 @@ def send_image_to_room(room_name: str, image_path: str) -> Dict:
     time.sleep(config.IMAGE_SET_FOCUS_WAIT_SEC)
 
     # Paste (Ctrl+V) — triggers KakaoTalk's image send confirmation dialog
+    _require_focus(hwnd, edit_hwnd)
     _send_ctrl_key_combo(0x56)  # Ctrl+V
 
     # Wait for the confirmation dialog to appear (it's a separate window).
@@ -432,7 +478,7 @@ def send_image_to_room(room_name: str, image_path: str) -> Dict:
     for _ in range(40):  # up to ~6 seconds
         time.sleep(config.IMAGE_DIALOG_POLL_INTERVAL_SEC)
         fg = _user32.GetForegroundWindow()
-        if fg != hwnd and fg != 0:
+        if fg and win32gui.GetWindow(fg, win32con.GW_OWNER) == hwnd and fg != hwnd:
             dialog_hwnd = fg
             break
 
@@ -443,6 +489,9 @@ def send_image_to_room(room_name: str, image_path: str) -> Dict:
     # The dialog is already the foreground window.  Give it time to fully
     # render, then press Enter to confirm.
     time.sleep(config.IMAGE_CONFIRM_WAIT_SEC)
+    if (_user32.GetForegroundWindow() != dialog_hwnd
+            or win32gui.GetWindow(dialog_hwnd, win32con.GW_OWNER) != hwnd):
+        return {"success": False, "error": "Image preview lost focus or changed owner"}
     _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
     time.sleep(0.05)
     _user32.keybd_event(config.VK_RETURN, 0, config.KEYEVENTF_KEYUP, 0)
@@ -504,22 +553,15 @@ def read_chat_messages(room_name: str) -> Dict:
     time.sleep(config.WINDOW_ACTIVATE_WAIT_SEC)
 
     # Click on the list control to ensure it has focus
-    try:
-        rect = win32gui.GetWindowRect(list_hwnd)
-        cx = (rect[0] + rect[2]) // 2
-        cy = (rect[1] + rect[3]) // 2
-        _user32.SetCursorPos(cx, cy)
-        _user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
-        _user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
-        time.sleep(config.EDIT_CLICK_WAIT_SEC)
-    except Exception:
-        pass
+    _click_control(hwnd, list_hwnd)
 
     # Ctrl+A (select all)
+    _require_focus(hwnd, list_hwnd)
     _send_ctrl_key_combo(config.VK_A)
     time.sleep(config.KEY_COMBO_WAIT_SEC)
 
     # Ctrl+C (copy)
+    _require_focus(hwnd, list_hwnd)
     _send_ctrl_key_combo(config.VK_C)
     time.sleep(config.KEY_COMBO_WAIT_SEC)
 
@@ -634,7 +676,7 @@ def search_and_open_room(room_name: str) -> Dict:
 
     # Ensure KakaoTalk is in the foreground before sending keyboard events
     if not _ensure_foreground(main_hwnd):
-        _log("Warning: Could not bring KakaoTalk to foreground")
+        return {"success": False, "error": "Could not activate KakaoTalk main window"}
 
     # Ctrl+F activates the search bar (Edit becomes visible and focused)
     edit_hwnd = _activate_search_and_get_edit(main_hwnd)
@@ -657,6 +699,7 @@ def search_and_open_room(room_name: str) -> Dict:
     time.sleep(config.SEARCH_RESULTS_WAIT_SEC)  # Wait for search results to populate
 
     # Press Enter to open the first search result (already selected by default)
+    _require_focus(main_hwnd, edit_hwnd)
     _log("Pressing Enter to open first search result")
     _user32.keybd_event(config.VK_RETURN, 0, 0, 0)
     _user32.keybd_event(config.VK_RETURN, 0, config.KEYEVENTF_KEYUP, 0)
@@ -670,20 +713,6 @@ def search_and_open_room(room_name: str) -> Dict:
     for w in all_windows:
         if w["title"] == room_name:
             return {"success": True, "message": f"Opened chat room '{room_name}'", "hwnd": w["hwnd"]}
-    for w in all_windows:
-        if room_name in w["title"]:
-            return {
-                "success": True,
-                "message": f"Opened chat room '{w['title']}' (searched: '{room_name}')",
-                "hwnd": w["hwnd"],
-            }
-    if all_windows:
-        return {
-            "success": True,
-            "message": f"Opened a chat window (title: '{all_windows[0]['title']}')",
-            "hwnd": all_windows[0]["hwnd"],
-        }
-
     return {
         "success": False,
         "error": f"Chat room '{room_name}' not found after search. "
@@ -940,16 +969,7 @@ def send_mention_message(room_name: str, mention_name: str, message: str) -> Dic
     # Bring window to foreground and click on edit control for focus
     bring_window_to_front(hwnd)
     time.sleep(config.MENTION_FOCUS_WAIT_SEC)
-    try:
-        rect = win32gui.GetWindowRect(edit_hwnd)
-        cx = (rect[0] + rect[2]) // 2
-        cy = (rect[1] + rect[3]) // 2
-        _user32.SetCursorPos(cx, cy)
-        _user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
-        _user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
-        time.sleep(config.MENTION_CLICK_WAIT_SEC)
-    except Exception:
-        pass
+    _click_control(hwnd, edit_hwnd)
 
     # Type '@' using Shift+2 (keybd_event required to activate mention popup)
     _press_key(0x32, shift=True)
@@ -958,10 +978,12 @@ def send_mention_message(room_name: str, mention_name: str, message: str) -> Dic
     # Type mention name using Korean 2벌식 keyboard simulation
     keys = _decompose_korean(mention_name)
     for vk, shift in keys:
+        _require_focus(hwnd, edit_hwnd)
         _press_key(vk, shift=shift)
     time.sleep(config.MENTION_NAME_WAIT_SEC)
 
     # Press Enter to select the mention from the popup
+    _require_focus(hwnd, edit_hwnd)
     _press_key(config.VK_RETURN)
     time.sleep(config.MENTION_SELECT_WAIT_SEC)
 
@@ -971,10 +993,12 @@ def send_mention_message(room_name: str, mention_name: str, message: str) -> Dic
     win32clipboard.SetClipboardText(' ' + message, win32clipboard.CF_UNICODETEXT)
     win32clipboard.CloseClipboard()
     time.sleep(config.CLIPBOARD_PASTE_WAIT_SEC)
+    _require_focus(hwnd, edit_hwnd)
     _send_ctrl_key_combo(0x56)  # Ctrl+V
     time.sleep(config.MENTION_PASTE_WAIT_SEC)
 
     # Press Enter to send the message
+    _require_focus(hwnd, edit_hwnd)
     _press_key(config.VK_RETURN)
     time.sleep(config.MENTION_SEND_WAIT_SEC)
 
@@ -992,14 +1016,15 @@ class ChatMonitor:
     """Background chat room monitor with keyword detection.
 
     Polls a single chat room at a configurable interval, detects new messages
-    via hash-based diffing, and queues events when keywords are matched.
+    by comparing message occurrence counts, and queues events when keywords are matched.
     """
 
     def __init__(self):
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._events: deque = deque(maxlen=100)
-        self._seen_hashes: set = set()
+        self._events_lock = threading.Lock()
+        self._seen_counts = Counter()
         self._room_name: str = ""
         self._keywords: List[str] = []
         self._poll_interval: float = 5.0
@@ -1019,11 +1044,15 @@ class ChatMonitor:
         self._poll_interval = max(3.0, poll_interval)
         self._stop_event.clear()
         self._events.clear()
-        self._seen_hashes.clear()
+        self._seen_counts.clear()
         self._running = True
 
         # Load existing messages so they don't trigger events
-        self._load_initial_messages()
+        try:
+            self._load_initial_messages()
+        except Exception as error:
+            self._running = False
+            return {"success": False, "error": str(error)}
 
         self._thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self._thread.start()
@@ -1039,32 +1068,29 @@ class ChatMonitor:
             return {"success": False, "error": "Monitor not running"}
         self._stop_event.set()
         self._thread.join(timeout=10)
+        if self._thread.is_alive():
+            return {"success": False, "error": "Monitor is finishing its current UI operation"}
         self._running = False
         return {"success": True, "message": "Monitor stopped"}
 
     def get_events(self) -> List[Dict]:
         """Return and clear all pending keyword-match events."""
-        events = list(self._events)
-        self._events.clear()
+        with self._events_lock:
+            events = list(self._events)
+            self._events.clear()
         return events
 
-    def _msg_hash(self, msg: Dict) -> str:
-        """Create a hash to uniquely identify a message."""
-        key = f"{msg.get('sender', '')}|{msg.get('time', '')}|{msg.get('text', '')[:80]}"
-        return hashlib.md5(key.encode()).hexdigest()
+    def _message_key(self, msg):
+        return tuple(msg.get(field) for field in ('date', 'sender', 'time', 'text'))
 
     def _load_initial_messages(self):
-        """Read current messages and store their hashes (baseline)."""
-        try:
-            result = read_chat_messages(self._room_name)
-            if result["success"]:
-                from . import parser
-                parsed = parser.parse_chat_text(result["raw_text"])
-                for msg in parsed["messages"]:
-                    self._seen_hashes.add(self._msg_hash(msg))
-                _log(f"Monitor baseline: {len(self._seen_hashes)} existing messages")
-        except Exception as e:
-            _log(f"Monitor baseline error: {e}")
+        from . import backend, parser
+
+        result = backend.read_chat_messages(self._room_name)
+        if not result["success"]:
+            raise RuntimeError(result["error"])
+        parsed = result.get('parsed') or parser.parse_chat_text(result["raw_text"])
+        self._seen_counts.update(self._message_key(msg) for msg in parsed["messages"])
 
     def _monitor_loop(self):
         """Background polling loop."""
@@ -1081,20 +1107,23 @@ class ChatMonitor:
 
     def _check_for_new_messages(self):
         """Poll for new messages and check for keyword matches."""
-        result = read_chat_messages(self._room_name)
+        from . import backend
+        result = backend.read_chat_messages(self._room_name)
         if not result["success"]:
             return
 
         from . import parser
-        parsed = parser.parse_chat_text(result["raw_text"])
+        parsed = result.get('parsed') or parser.parse_chat_text(result["raw_text"])
         all_messages = parsed["messages"]
 
         new_messages = []
+        counts = Counter()
         for msg in all_messages:
-            h = self._msg_hash(msg)
-            if h not in self._seen_hashes:
-                self._seen_hashes.add(h)
+            key = self._message_key(msg)
+            counts[key] += 1
+            if counts[key] > self._seen_counts[key]:
                 new_messages.append(msg)
+        self._seen_counts |= counts
 
         if not new_messages:
             return
@@ -1106,12 +1135,14 @@ class ChatMonitor:
             for kw in self._keywords:
                 if kw in text_lower:
                     context_start = max(0, len(all_messages) - 10)
-                    self._events.append({
+                    event = {
                         "keyword": kw,
                         "trigger_message": msg,
                         "recent_context": all_messages[context_start:],
                         "room_name": self._room_name,
-                    })
+                    }
+                    with self._events_lock:
+                        self._events.append(event)
                     _log(f"Monitor: keyword '{kw}' matched in message from {msg.get('sender')}")
                     break  # One event per message
 
