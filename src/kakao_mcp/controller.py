@@ -138,6 +138,28 @@ def find_child_window_recursive(parent_hwnd: int, class_name: str) -> Optional[i
     return found[0] if found else None
 
 
+def find_chat_input(room):
+    """Prefer KakaoTalk's message control ID, retaining unique legacy layouts."""
+    pid = win32process.GetWindowThreadProcessId(room)[1]
+    editors = []
+    known = []
+
+    def visit(child, _):
+        if (win32gui.GetClassName(child) == config.KAKAO_EDIT_CLASS
+                and win32gui.IsWindowVisible(child) and win32gui.IsWindowEnabled(child)
+                and win32process.GetWindowThreadProcessId(child)[1] == pid):
+            editors.append(child)
+            if win32gui.GetDlgCtrlID(child) == 1006:
+                known.append(child)
+        return True
+
+    win32gui.EnumChildWindows(room, visit, None)
+    candidates = known or editors
+    if len(candidates) > 1:
+        raise _PasteError('input_ambiguous', 'Multiple candidate message inputs in the same room')
+    return candidates[0] if candidates else None
+
+
 def _is_chat_window(hwnd: int) -> bool:
     """A chat room holds both the message input and the message list.
 
@@ -412,7 +434,7 @@ def _paste_into_focused_input(hwnd, edit, room_name, expected, target, replace_l
         if target:
             target.verify()
         if (find_chat_window(room_name) != hwnd
-                or find_child_window_recursive(hwnd, config.KAKAO_EDIT_CLASS) != edit
+                or find_chat_input(hwnd) != edit
                 or not win32gui.IsWindowEnabled(hwnd)):
             raise _PasteError('room_changed', 'Room or input changed before paste')
         _require_focus(hwnd, edit)
@@ -502,7 +524,7 @@ def send_message_to_room(room_name: str, text: str, *, target=None, replace_lega
     if hwnd is None:
         return {"success": False, "error": f"Chat window '{room_name}' not found"}
 
-    edit_hwnd = find_child_window_recursive(hwnd, config.KAKAO_EDIT_CLASS)
+    edit_hwnd = find_chat_input(hwnd)
     if edit_hwnd is None:
         return {"success": False, "status": "failed_before_send", "code": "input_not_found", "error": f"Edit control not found in '{room_name}'"}
 
@@ -540,6 +562,8 @@ def send_message_to_room(room_name: str, text: str, *, target=None, replace_lega
 def _submit_draft(room_name, hwnd, edit_hwnd, expected, target=None, *, literal_hint=None):
     if target:
         target.verify()
+    if find_chat_input(hwnd) != edit_hwnd:
+        return {"success": False, "status": "failed_before_send", "code": "room_changed", "error": "Message input changed"}
     button = _native_send_button(hwnd)
     if button:
         if find_chat_window(room_name) != hwnd or not _matches_draft(edit_hwnd, expected):
@@ -702,7 +726,7 @@ def send_image_to_room(room_name: str, image_path: str, *, target=None) -> Dict:
     if hwnd is None:
         return {"success": False, "error": f"Chat window '{room_name}' not found"}
 
-    edit_hwnd = find_child_window_recursive(hwnd, config.KAKAO_EDIT_CLASS)
+    edit_hwnd = find_chat_input(hwnd)
     if edit_hwnd is None:
         return {"success": False, "status": "failed_before_send", "code": "input_not_found", "error": f"Edit control not found in '{room_name}'"}
 
@@ -743,7 +767,7 @@ def send_images_to_room(room_name: str, image_paths: List[str]) -> Dict:
 
 @operation()
 def read_chat_messages(room_name: str, read_mode=None, max_messages=None, *, monitoring=False,
-                       all_history=False) -> Dict:
+                       all_history=False, target=None) -> Dict:
     """Read the native list text when available, or copy the transcript.
 
     NOTE: This briefly brings the chat window to the foreground.
@@ -751,7 +775,9 @@ def read_chat_messages(room_name: str, read_mode=None, max_messages=None, *, mon
     Returns:
         Dict with success (bool), raw_text (str), and error if failed.
     """
-    hwnd = find_chat_window(room_name)
+    if target:
+        target.verify()
+    hwnd = target.hwnd if target else find_chat_window(room_name)
     if hwnd is None:
         return {"success": False, "error": f"Chat window '{room_name}' not found", "raw_text": ""}
 
@@ -770,13 +796,32 @@ def read_chat_messages(room_name: str, read_mode=None, max_messages=None, *, mon
         except win32gui.error:
             raw = ''
         parsed = parse_chat_text(raw)
-        if parsed['messages']:
+        if parsed['room_name'] and parsed['room_name'] != room_name:
+            return {"success": False, "error": "Transcript room header changed"}
+        if parsed['messages'] or (parsed['room_name'] == room_name and parsed['member_count'] is not None):
             parsed['read_method'] = 'win32_text'
             parsed['partial'] = True
             parsed['room_name'] = room_name
+            if target:
+                target.verify()
             if (read_mode == 'background' or
                     (not all_history and (not max_messages or len(parsed['messages']) >= max_messages))):
                 return {"success": True, "raw_text": raw, "parsed": parsed}
+        if read_mode == 'background' and not monitoring and not target:
+            try:
+                pid = win32process.GetWindowThreadProcessId(hwnd)[1]
+                result = bridge.request(dict(action='legacy_ocr', room=room_name, hwnd=hwnd, process_id=pid,
+                                             list_hwnd=list_hwnd, qt=False), 6)
+                if find_chat_window(room_name) != hwnd:
+                    raise RuntimeError("Room window changed during OCR")
+                lines = result['lines']
+                if not lines:
+                    raise RuntimeError("No legible text in the visible message list")
+                return {"success": True, "parsed": dict(room_name=room_name, member_count=None, messages=[],
+                        ocr_lines=lines, partial=True, scope='visible_list', read_method='win32_ocr',
+                        unknown_fields=['message_boundaries', 'sender', 'time', 'date'])}
+            except Exception as error:
+                return {"success": False, "error": f"No background transcript. {error}. Use complete mode."}
         if read_mode == 'background':
             return {"success": False, "error": "The legacy message list exposes no background transcript; use complete mode"}
         if monitoring:
@@ -790,6 +835,10 @@ def read_chat_messages(room_name: str, read_mode=None, max_messages=None, *, mon
     time.sleep(config.WINDOW_ACTIVATE_WAIT_SEC)
 
     # Prefer transferring focus directly to the list.
+    if target:
+        target.verify()
+        if find_child_window_recursive(hwnd, config.KAKAO_LIST_CONTROL_CLASS) != list_hwnd:
+            raise RuntimeError("Target history list changed")
     _focus_control(hwnd, list_hwnd)
 
     # Ctrl+A (select all)
@@ -811,6 +860,8 @@ def read_chat_messages(room_name: str, read_mode=None, max_messages=None, *, mon
     if win32clipboard.GetClipboardSequenceNumber() != after:
         return {"success": False, "error": "Clipboard changed during transcript copy"}
     _restore_plain_clipboard(snapshot, before, after)
+    if target:
+        target.verify()
 
     return {"success": True, "raw_text": raw_text}
 
@@ -940,8 +991,12 @@ def search_and_open_room(room_name: str) -> Dict:
     if edit_hwnd is None:
         return {"success": False, "error": "Search box not found in KakaoTalk main window"}
 
-    win32gui.SendMessageTimeout(edit_hwnd, win32con.EM_SETSEL, 0, -1, win32con.SMTO_ABORTIFHUNG, 1500)
-    _replace_selection(edit_hwnd, room_name)
+    existing = _edit_text(edit_hwnd)
+    if existing and existing != room_name:
+        return {"success": False, "code": "search_draft_exists", "error": "Chat search already contains a different query"}
+    if not existing:
+        win32gui.SendMessageTimeout(edit_hwnd, win32con.EM_SETSEL, -1, -1, win32con.SMTO_ABORTIFHUNG, 1500)
+        _replace_selection(edit_hwnd, room_name)
     if _edit_text(edit_hwnd) != room_name:
         return {"success": False, "error": "Could not verify exact room search text"}
     view = _find_chat_list_view(main_hwnd)
@@ -1229,7 +1284,7 @@ def send_mention_message(room_name: str, mention_name: str, message: str, *, tar
     if target:
         target.verify()
     hwnd = target.hwnd if target else find_chat_window(room_name)
-    edit = find_child_window_recursive(hwnd, config.KAKAO_EDIT_CLASS) if hwnd else None
+    edit = find_chat_input(hwnd) if hwnd else None
     if not edit:
         return {"success": False, "status": "failed_before_send", "error": "Target chat input not found"}
     if not _empty_input(edit):

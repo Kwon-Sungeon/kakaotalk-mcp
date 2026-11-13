@@ -104,7 +104,7 @@ def test_list_chat_windows(mock_gui):
 # ---------------------------------------------------------------------------
 
 @patch("kakao_mcp.controller.win32api")
-@patch("kakao_mcp.controller.find_child_window_recursive")
+@patch("kakao_mcp.controller.find_chat_input")
 @patch("kakao_mcp.controller.find_chat_window")
 def test_send_message_success(mock_find, mock_child, mock_api):
     mock_find.return_value = 11111
@@ -135,7 +135,7 @@ def test_send_message_room_not_found(mock_find):
     assert "not found" in result["error"]
 
 
-@patch("kakao_mcp.controller.find_child_window_recursive")
+@patch("kakao_mcp.controller.find_chat_input")
 @patch("kakao_mcp.controller.find_chat_window")
 def test_send_message_no_edit_control(mock_find, mock_child):
     mock_find.return_value = 11111
@@ -244,7 +244,7 @@ def test_copy_image_to_clipboard_not_found(mock_abs, mock_isfile):
 @patch("kakao_mcp.controller._user32")
 @patch("kakao_mcp.controller._send_ctrl_key_combo")
 @patch("kakao_mcp.controller.bring_window_to_front")
-@patch("kakao_mcp.controller.find_child_window_recursive")
+@patch("kakao_mcp.controller.find_chat_input")
 @patch("kakao_mcp.controller.find_chat_window")
 @patch("os.path.splitext", return_value=("C:\\test\\image", ".jpg"))
 @patch("os.path.isfile", return_value=True)
@@ -301,7 +301,7 @@ def test_wrong_foreground_cannot_paste_or_send():
     controller.win32gui.GetWindowRect.return_value = (0, 0, 50, 50)
     controller._user32.GetForegroundWindow.return_value = 33333
     with patch.object(controller, 'find_chat_window', return_value=11111), \
-            patch.object(controller, 'find_child_window_recursive', return_value=22222), \
+            patch.object(controller, 'find_chat_input', return_value=22222), \
             patch.object(controller, '_edit_text', side_effect=['', 'sample']), \
             patch.object(controller, 'bring_window_to_front'):
         result = controller.send_message_to_room('TestRoom', 'sample')
@@ -312,7 +312,7 @@ def test_wrong_foreground_cannot_paste_or_send():
 
 def test_native_send_button_does_not_activate_window():
     with patch.object(controller, 'find_chat_window', return_value=11), \
-            patch.object(controller, 'find_child_window_recursive', return_value=22), \
+            patch.object(controller, 'find_chat_input', return_value=22), \
             patch.object(controller, '_replace_selection'), \
             patch.object(controller, '_native_send_button', return_value=33), \
             patch.object(controller, '_edit_text', side_effect=['', 'sample', 'sample', '']), \

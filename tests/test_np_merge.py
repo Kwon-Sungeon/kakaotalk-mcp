@@ -289,7 +289,7 @@ def test_buttonless_paste_and_exact_submission(monkeypatch, scenario, code):
     monkeypatch.setattr(controller, '_wait_until', lambda check, timeout: check())
     monkeypatch.setattr(controller, 'find_chat_window',
                         lambda _: 99 if scenario == 'room_change' and state['seq'] != 10 else 11)
-    monkeypatch.setattr(controller, 'find_child_window_recursive', lambda *_: 22)
+    monkeypatch.setattr(controller, 'find_chat_input', lambda *_: 22)
     monkeypatch.setattr(controller, '_native_send_button', lambda *_, **__: None)
     monkeypatch.setattr(controller, '_edit_text', lambda _: state['draft'])
     def edit_message(edit, msg, w, l, *args):

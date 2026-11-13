@@ -107,16 +107,24 @@ def kakao_list_open_rooms() -> Dict:
 
 
 @tool
-def kakao_open_room(room_name: str, focus: bool = False) -> Dict:
+def kakao_open_room(room_name: str, focus: bool = False, self_only: bool = False) -> Dict:
     """Open a KakaoTalk chat room by name. An existing room keeps its position.
-    Set focus=true when the user wants to see the room.
+    Set focus=true when the user wants to see the room. On Qt, self_only verifies KakaoTalk’s self-chat label.
     If not, searches for the room in KakaoTalk's search bar.
 
     Args:
         room_name: The name of the chat room or person to open.
     """
     with operation():
-        room = delivery.resolve(room_name)
+        if self_only:
+            from . import qt_controller
+            if not qt_controller.available():
+                raise delivery.DeliveryError('self_identity_unavailable', 'This client does not expose the self-chat label')
+            opened = qt_controller.call('open', room=room_name, self_only=True)
+            ref = f"qt:{delivery.legacy.win32process.GetWindowThreadProcessId(opened['hwnd'])[1]}:{opened['hwnd']}"
+            room = delivery.resolve(room_name, ref)
+        else:
+            room = delivery.resolve(room_name)
         if focus:
             room.verify()
             controller.bring_window_to_front(room.hwnd)
@@ -195,6 +203,12 @@ def kakao_read_messages(room_name: str, max_messages: Optional[int] = None, read
         if not result["success"]:
             return {"error": result["error"], "code": result.get("code", "read_failed")}
         parsed = result.get('parsed') or parser.parse_chat_text(result["raw_text"])
+        if 'ocr_lines' in parsed:
+            if sender:
+                return {"error": "OCR cannot identify senders. Use complete mode for a sender filter."}
+            lines = [line for line in parsed['ocr_lines'] if not contains or contains.casefold() in line.casefold()]
+            return {**parsed, "ocr_lines": lines[-(max_messages or 50):],
+                    "message": "Visible OCR lines; message boundaries and senders are unknown"}
         messages = parser.filter_messages(parser.enrich_messages(parsed["messages"]), sender, contains)
         max_messages = max_messages or 50
         if len(messages) > max_messages:
@@ -231,6 +245,13 @@ def kakao_extract_links(room_name: str, read_mode: Optional[ReadMode] = None, un
         if not result["success"]:
             return {"error": result["error"], "code": result.get("code", "read_failed")}
         parsed = result.get('parsed') or parser.parse_chat_text(result["raw_text"])
+        if 'ocr_lines' in parsed:
+            urls = parser.find_urls('\n'.join(parsed['ocr_lines']))
+            if unique:
+                urls = list(dict.fromkeys(urls))
+            return {"room_name": room_name, "partial": True, "read_method": "win32_ocr",
+                    "links": [{"url": url, "sender": None, "time": None, "date": None, "timestamp": None}
+                             for url in urls if not contains or contains.casefold() in url.casefold()]}
         urls = parser.extract_urls_from_messages(parser.enrich_messages(parsed["messages"]), unique=unique)
         if contains:
             urls = [row for row in urls if contains.casefold() in row["url"].casefold()]

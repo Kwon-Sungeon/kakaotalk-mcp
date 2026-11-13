@@ -97,7 +97,7 @@ def file_clipboard(path):
         legacy._restore_plain_clipboard(snapshot, before, after)
 
 
-def dispatch(room, kind, value, mention, *, replace_legacy_hint=False):
+def _submit(room, kind, value, mention, *, replace_legacy_hint=False):
     args = room.arguments()
     if kind in ('file', 'file_clipboard', 'file_picker'):
         if kind == 'file_picker' and room.is_qt:
@@ -106,7 +106,7 @@ def dispatch(room, kind, value, mention, *, replace_legacy_hint=False):
             raise error
         if room.is_qt or kind == 'file_clipboard':
             if not room.is_qt:
-                edit = legacy.find_child_window_recursive(room.hwnd, config.KAKAO_EDIT_CLASS)
+                edit = legacy.find_chat_input(room.hwnd)
                 if not edit or not legacy._empty_input(edit):
                     error = DeliveryError('input_not_ready', 'Empty legacy chat input required')
                     error.before_send = True
@@ -126,6 +126,99 @@ def dispatch(room, kind, value, mention, *, replace_legacy_hint=False):
     if kind == 'mention':
         return legacy.send_mention_message(room.name, mention, value, target=room)
     return legacy.send_message_to_room(room.name, value, target=room, replace_legacy_hint=replace_legacy_hint)
+
+
+def _conversation(room, mode=None):
+    """Snapshot the same room and read path on each side of a submission."""
+    from .parser import parse_chat_text
+    if room.is_qt:
+        data = qt.call('read', **room.arguments())
+        if data.get('hwnd') != room.hwnd or data.get('process_id') != room.pid or data.get('at_end') is False:
+            return None, 'uia'
+        rows = data['messages']
+        # Empty UIA arrays also occur when the transcript is not exposed.
+        if not rows:
+            return None, 'uia'
+        mode = 'uia'
+    else:
+        result = legacy.read_chat_messages(room.name, mode or 'auto', target=room)
+        if not result.get('success'):
+            return None, mode
+        parsed = result.get('parsed') or parse_chat_text(result['raw_text'])
+        if parsed.get('room_name') not in (None, room.name):
+            return None, mode
+        rows = parsed['messages']
+        mode = 'background' if result.get('parsed') else 'complete'
+        if not rows and not (parsed.get('room_name') == room.name and parsed.get('member_count') is not None):
+            return None, mode
+    return [(row.get('sender'), row.get('time'), row.get('text'), bool(row.get('is_photo')),
+             bool(row.get('is_file')), row.get('outgoing')) for row in rows], mode
+
+
+def _new_bubble(before, after, kind, value, mention):
+    if before is None or after is None or not after:
+        return False
+    # A shifted viewport may drop older rows. Require the previous tail to
+    # overlap uniquely, so a scroll or a repeated old message is not proof.
+    if after[:len(before)] == before:
+        added = after[len(before):]
+    else:
+        anchor = before[-1]
+        if before.count(anchor) != 1:
+            return False
+        try:
+            overlap = after.index(anchor) + 1
+        except ValueError:
+            return False
+        if overlap < 2 or before[-overlap:] != after[:overlap]:
+            return False
+        added = after[overlap:]
+    expected = ('@' + mention + ' ' + value if kind == 'mention' else value).replace('\r\n', '\n').replace('\r', '\n')
+    if len(added) != 1:
+        return False
+    _, _, body, photo, file, outgoing = added[0]
+    if outgoing is False:
+        return False
+    if kind == 'image':
+        return photo
+    if kind == 'file':
+        name = Path(value).name
+        return file and body in (name, '파일: ' + name)
+    return not photo and not file and body == expected
+
+
+def dispatch(room, kind, value, mention, *, replace_legacy_hint=False):
+    chat_kind = 'file' if kind.startswith('file_') else kind
+    before, mode = None, None
+    try:
+        before, mode = _conversation(room)
+    except Exception:
+        pass  # Still submit once; missing evidence can only produce an unconfirmed receipt.
+    # A failed baseline read may have involved a window change. Re-pin before writing.
+    try:
+        room.verify()
+        if not room.is_qt:
+            legacy.find_chat_input(room.hwnd)
+    except Exception as error:
+        error.before_send = True
+        raise
+    outcome = _submit(room, kind, value, mention, replace_legacy_hint=replace_legacy_hint)
+    if not (outcome.get('success') or outcome.get('sent')):
+        return outcome
+    if before is not None:
+        deadline = time.monotonic() + 2.0
+        while True:
+            try:
+                after, _ = _conversation(room, mode)
+            except Exception:
+                break
+            if _new_bubble(before, after, chat_kind, value, mention):
+                return {'sent': True, 'confirmation': 'new_room_bubble'}
+            if time.monotonic() >= deadline or mode == 'complete':
+                break
+            time.sleep(.12)
+    return {'success': False, 'status': 'unconfirmed', 'code': 'send_unconfirmed',
+            'error': 'New matching bubble not verified in the pinned room. Inspect the room before retrying.'}
 
 
 def _journal():

@@ -109,7 +109,7 @@ def test_qt_file_paste_binds_clipboard_path_and_room(monkeypatch, tmp_path):
     clip.GetClipboardSequenceNumber.side_effect = [10, 11]
     worker = Mock(return_value={'sent': True})
     monkeypatch.setattr(d.bridge, 'request', worker)
-    assert d.dispatch(d.Room('self', 23, 17, True), 'file', path, None)['sent']
+    assert d._submit(d.Room('self', 23, 17, True), 'file', path, None)['sent']
     fmt, raw = clip.SetClipboardData.call_args.args
     assert fmt == win32con.CF_HDROP and struct.unpack('<IiiII', raw[:20]) == (20, 0, 0, 0, 1)
     assert raw[20:].decode('utf-16-le') == path + '\0\0'
@@ -120,7 +120,7 @@ def test_qt_file_paste_binds_clipboard_path_and_room(monkeypatch, tmp_path):
 
 def test_legacy_mention_preserves_draft_and_never_sends_blind_enter(monkeypatch):
     monkeypatch.setattr(legacy, 'find_chat_window', lambda name: 1)
-    monkeypatch.setattr(legacy, 'find_child_window_recursive', lambda *args: 2)
+    monkeypatch.setattr(legacy, 'find_chat_input', lambda *args: 2)
     monkeypatch.setattr(legacy, '_edit_text', lambda _: 'my draft')
     key = Mock()
     monkeypatch.setattr(legacy, '_press_key', key)
@@ -186,3 +186,46 @@ def test_explicit_legacy_hint_does_not_bypass_a_previous_uncertain_send(fake):
     assert server.kakao_send_message('fixture', '테스트', request_id='second',
                                      replace_legacy_hint=True)['code'] == 'previous_send_unconfirmed'
     fake.assert_called_once()
+
+
+def test_legacy_editor_uses_known_id_and_rejects_ambiguous_fallback(monkeypatch):
+    gui = legacy.win32gui
+    gui.EnumChildWindows.side_effect = lambda _, visit, arg: [visit(h, arg) for h in (11, 12, 13)]
+    gui.GetClassName.return_value = legacy.config.KAKAO_EDIT_CLASS
+    gui.IsWindowVisible.side_effect = lambda h: h != 13
+    gui.GetDlgCtrlID.side_effect = lambda h: 1006 if h in (12, 13) else 1
+    assert legacy.find_chat_input(1) == 12
+    gui.GetDlgCtrlID.side_effect = lambda h: 2
+    with pytest.raises(RuntimeError, match='Multiple'):
+        legacy.find_chat_input(1)
+    gui.IsWindowEnabled.side_effect = lambda h: h == 11
+    assert legacy.find_chat_input(1) == 11
+
+
+def test_cleared_draft_without_new_bubble_cannot_be_retried(tmp_path, monkeypatch):
+    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path))
+    room = Mock(ref='qt:7:3', is_qt=True)
+    monkeypatch.setattr(d, 'resolve', Mock(return_value=room))
+    row = ('me', '10:34', '테스트', False, False, True)
+    monkeypatch.setattr(d, '_conversation', lambda *_: ([row], 'complete'))
+    submit = Mock(return_value={'sent': True, 'confirmation': 'draft_cleared'})
+    monkeypatch.setattr(d, '_submit', submit)
+    assert server.kakao_send_message('self', '테스트', request_id='one')['results'][0]['status'] == 'unconfirmed'
+    assert server.kakao_send_message('self', '테스트', request_id='one')['replayed']
+    assert server.kakao_send_bulk(['self'], '테스트', request_id='two')['code'] == 'previous_send_unconfirmed'
+    submit.assert_called_once()
+
+
+def test_new_bubble_requires_exact_new_content_and_an_anchored_tail():
+    def row(text, outgoing=True):
+        return (None, '10:34', text, False, False, outgoing)
+    test = row('테스트')
+    old = [row('one'), row('two'), test]
+    def check(after):
+        return d._new_bubble(old, after, 'text', '테스트', None)
+    assert check(old + [test]) and check(old[1:] + [test])
+    assert not check(old) and not check([test])
+    assert not check(old + [row('테스트 수정')])
+    assert not check(old + [row('테스트', False)])
+    assert not check(old + [test, test])
+    assert not d._new_bubble(None, [test], 'text', '테스트', None)

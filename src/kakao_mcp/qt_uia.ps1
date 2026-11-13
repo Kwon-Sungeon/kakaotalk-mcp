@@ -9,11 +9,15 @@ using System;
 using System.Runtime.InteropServices;
 public class KakaoInput {
  [StructLayout(LayoutKind.Sequential)] public struct Point {public int X; public int Y;}
+ [DllImport("user32.dll")] public static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
  [DllImport("user32.dll")] public static extern bool GetCursorPos(out Point p);
  public static Point Cursor(){Point p; if(!GetCursorPos(out p)) throw new InvalidOperationException("Cursor unavailable"); return p;}
  [StructLayout(LayoutKind.Sequential)] private struct LastInput { public uint Size; public uint Tick; }
  [DllImport("user32.dll")] private static extern bool GetLastInputInfo(ref LastInput info);
  public static uint InputTick(){var info=new LastInput{Size=8}; if(!GetLastInputInfo(ref info)) throw new InvalidOperationException("Input time unavailable"); return info.Tick;}
+ [StructLayout(LayoutKind.Sequential)] public struct Rect { public int Left,Top,Right,Bottom; }
+ [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h,out Rect rect);
+ [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h,IntPtr dc,uint flags);
  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
  [DllImport("user32.dll", CharSet=CharSet.Unicode)] private static extern IntPtr SendMessageTimeoutW(IntPtr hwnd,uint message,IntPtr w,IntPtr l,uint flags,uint timeout,out IntPtr result);
@@ -410,11 +414,6 @@ function ChatTab($w){
  Invoke $tab
  Start-Sleep -Milliseconds 250
 }
-function Snapshot($w){
- @(ChatItems $w | ForEach-Object {
-  $_.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern).DocumentRange.GetText(-1)
- })
-}
 function VisibleCenter($window, $element) {
  $bounds=$window.Current.BoundingRectangle
  $item=$element.Current.BoundingRectangle
@@ -476,9 +475,76 @@ function Messages($items) {
   if($photo){$text='사진'}
   if($video){$text='동영상'}
   $urls=@([regex]::Matches($text,'https?://[^\s<>"'')\]]+') | ForEach-Object {$_.Value})
-  $messages+=@{sender=$sender;time=$time;text=$text;date=$date;is_photo=$photo;is_file=$file;is_video=$video;urls=$urls}
+  $outgoing=$null
+  if($bodies.Count -and $label -ceq ($text+', '+$time)){$outgoing=$true}
+  elseif($bodies.Count -and $sender){$outgoing=$false}
+  $messages+=@{outgoing=$outgoing;sender=$sender;time=$time;text=$text;date=$date;is_photo=$photo;is_file=$file;is_video=$video;urls=$urls}
  }
  $messages
+}
+# Windows OCR pipeline adapted from Contentrium's Kakao-Bridge (MIT).
+function RecognizeBitmap($bitmap) {
+ Add-Type -AssemblyName System.Drawing
+ Add-Type -AssemblyName System.Runtime.WindowsRuntime
+ $null=[Windows.Media.Ocr.OcrEngine,Windows.Foundation,ContentType=WindowsRuntime]
+ $null=[Windows.Media.Ocr.OcrResult,Windows.Foundation,ContentType=WindowsRuntime]
+ $null=[Windows.Globalization.Language,Windows.Globalization,ContentType=WindowsRuntime]
+ $null=[Windows.Storage.Streams.InMemoryRandomAccessStream,Windows.Storage.Streams,ContentType=WindowsRuntime]
+ $null=[Windows.Graphics.Imaging.BitmapDecoder,Windows.Graphics.Imaging,ContentType=WindowsRuntime]
+ $null=[Windows.Graphics.Imaging.SoftwareBitmap,Windows.Graphics.Imaging,ContentType=WindowsRuntime]
+ $engine=[Windows.Media.Ocr.OcrEngine]::TryCreateFromLanguage([Windows.Globalization.Language]::new('ko-KR'))
+ if(-not $engine){throw 'Windows Korean OCR is unavailable; use complete mode'}
+ $stream=$null; $output=$null; $software=$null
+ try {
+  $stream=[Windows.Storage.Streams.InMemoryRandomAccessStream]::new()
+  $output=[IO.WindowsRuntimeStreamExtensions]::AsStreamForWrite($stream)
+  $bitmap.Save($output,[Drawing.Imaging.ImageFormat]::Png); $output.Flush(); $stream.Seek(0)
+  $asTask=[System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+   $_.Name -eq 'AsTask' -and $_.IsGenericMethodDefinition -and $_.GetParameters().Count -eq 1 -and
+   $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+  } | Select-Object -First 1
+  function AwaitOcr($op,[Type]$type){
+   $task=$asTask.MakeGenericMethod($type).Invoke($null,@($op))
+   $task.GetAwaiter().GetResult()
+  }
+  $decoder=AwaitOcr ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+  $software=AwaitOcr ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+  $ocr=AwaitOcr ($engine.RecognizeAsync($software)) ([Windows.Media.Ocr.OcrResult])
+  $ocr.Lines | ForEach-Object {$_.Text}
+ } finally {
+  if($software){$software.Dispose()}
+  if($output){$output.Dispose()}
+  if($stream){$stream.Dispose()}
+ }
+}
+# Read a legacy list in memory without exposing other windows or the room's draft.
+function LegacyOcrLines {
+ InitializeInput
+ $null=[KakaoInput]::SetThreadDpiAwarenessContext([IntPtr](-4))
+ $null=FileRoom
+ $h=[IntPtr]$request.list_hwnd
+ $field=[System.Windows.Automation.AutomationElement]::FromHandle($h)
+ if($field.Current.ProcessId -ne $request.process_id -or $field.Current.ClassName -ne 'EVA_VH_ListControl_Dblclk' -or
+    -not [KakaoInput]::IsChild([IntPtr]$request.hwnd,$h) -or -not [KakaoInput]::IsWindowVisible($h) -or
+    [KakaoInput]::IsIconic([IntPtr]$request.hwnd)){throw 'Message list is unavailable for OCR'}
+ $rect=[KakaoInput+Rect]::new()
+ if(-not [KakaoInput]::GetClientRect($h,[ref]$rect) -or $rect.Right -lt 1 -or $rect.Bottom -lt 1 -or
+    [Math]::Max($rect.Right,$rect.Bottom) -gt 4096){throw 'Message list size is unavailable'}
+ Add-Type -AssemblyName System.Drawing
+ $bitmap=[Drawing.Bitmap]::new($rect.Right,$rect.Bottom)
+ try {
+  $g=[Drawing.Graphics]::FromImage($bitmap)
+  try {
+   $dc=$g.GetHdc()
+   try {if(-not [KakaoInput]::PrintWindow($h,$dc,3)){throw 'Message list capture failed'}} finally {$g.ReleaseHdc($dc)}
+  } finally {$g.Dispose()}
+  $lines=@(RecognizeBitmap $bitmap)
+  $null=FileRoom
+  if(-not [KakaoInput]::IsChild([IntPtr]$request.hwnd,$h)){throw 'Message list changed during OCR'}
+  @{lines=$lines}
+ } finally {
+  $bitmap.Dispose()
+ }
 }
 function RunRequest($request) {
  $script:dispatched=$false
@@ -488,6 +554,7 @@ function RunRequest($request) {
  try {
  if($request.action -in 'send','copy','image','file','mention','download','open','legacy_open_result','legacy_select_mention','legacy_image_confirm','legacy_send_button'){
   InitializeInput
+  $null=[KakaoInput]::SetThreadDpiAwarenessContext([IntPtr](-4))
   $previousWindow=[KakaoInput]::GetForegroundWindow()
   $script:lastInput=[KakaoInput]::InputTick()
  }
@@ -504,6 +571,7 @@ function RunRequest($request) {
    Invoke $button
    @{submitted=$true}
   }
+  'legacy_ocr' {LegacyOcrLines}
   'legacy_open_result' {LegacyOpenResult}
   'legacy_select_mention' {LegacyMention}
   'legacy_image_confirm' {$script:dispatched=$true; LegacyImageConfirm}
@@ -512,7 +580,7 @@ function RunRequest($request) {
   'rooms' { @{rooms=@(Windows | Where-Object {$_.Current.ClassName -match 'ChatWindow'} | ForEach-Object {@{title=$_.Current.Name;hwnd=$_.Current.NativeWindowHandle}})} }
   'open' {
    $existing=@(Windows | Where-Object {$_.Current.ClassName -match 'ChatWindow' -and $_.Current.Name -ceq $request.room})
-   if($existing.Count -eq 1){@{hwnd=$existing[0].Current.NativeWindowHandle}; break}
+   if($existing.Count -eq 1 -and -not $request.self_only){@{hwnd=$existing[0].Current.NativeWindowHandle}; break}
    if($existing.Count -gt 1){throw 'Multiple open rooms have this name'}
    $w=Main; ChatTab $w
    $field=Children $w | Where-Object {$_.Current.ClassName -like 'TextField*'} | Select-Object -First 1
@@ -532,14 +600,22 @@ function RunRequest($request) {
    try {
     (Value $field).SetValue($request.room)
     $namePattern='^(?:(?:팀채팅|그룹채팅|나와의 채팅), )?'+[regex]::Escape($request.room)+', '
-    $matches=@(WaitFor {Children $w | Where-Object {$_.Current.ControlType -eq [System.Windows.Automation.ControlType]::ListItem -and ($_.Current.Name -ceq $request.room -or $_.Current.Name -cmatch $namePattern)}} 3000)
+    if($request.self_only){$namePattern='^나와의 채팅, '+[regex]::Escape($request.room)+', '}
+    $matches=@(WaitFor {Children $w | Where-Object {$_.Current.ControlType -eq [System.Windows.Automation.ControlType]::ListItem -and (($_.Current.Name -ceq $request.room -and -not $request.self_only) -or $_.Current.Name -cmatch $namePattern)}} 3000)
     if($matches.Count -ne 1){throw "Expected one exact search result; found $($matches.Count)"}
     $lookup={Windows | Where-Object {$_.Current.ClassName -match 'ChatWindow' -and $_.Current.Name -ceq $request.room}}
-    $opened=$null
-    if(TryInvoke $matches[0]){$opened=WaitFor $lookup 1000}
+    $opened=& $lookup
+    if(-not $opened -and (TryInvoke $matches[0])){$opened=WaitFor $lookup 1000}
     if(-not $opened){
      Front $w
-     if(-not (& $lookup)){Click $matches[0] $true}
+     if(-not (& $lookup)){
+      $item=$matches[0]; $rect=$item.Current.BoundingRectangle
+      $x=[int]($rect.Left+$rect.Width/2); $y=[int]($rect.Top+$rect.Height/2)
+      AssertHit $item $x $y
+      if($searchValue.Current.Value -cne $request.room -or ($item.Current.Name -cnotmatch $namePattern -and
+         ($request.self_only -or $item.Current.Name -cne $request.room))){throw 'Room search result changed'}
+      Click $item $true
+     }
      $opened=WaitFor $lookup 3000
     }
    } finally {
@@ -668,7 +744,6 @@ function RunRequest($request) {
   'send' {
    $w=Room $request.room; $i=InputBox $w; $v=Value $i
    AssertRoomReady $w
-   $before=@(Snapshot $w | Where-Object {$_.StartsWith($request.text+', ')}).Count
    if($v.Current.Value){throw 'Chat has an existing draft'}
    $v.SetValue($request.text)
    if($v.Current.Value -cne $request.text){throw 'Input verification failed'}
@@ -681,12 +756,7 @@ function RunRequest($request) {
    Invoke $button; Start-Sleep -Milliseconds 500
    $fresh=Value (InputBox $w)
    if($fresh.Current.Value){throw 'Send outcome uncertain; do not retry automatically'}
-   $after=@(Snapshot $w | Where-Object {$_.StartsWith($request.text+', ')}).Count
-   if($after -le $before){
-    $confirmed=WaitFor {if(@(Snapshot (Room $request.room) | Where-Object {$_.StartsWith($request.text+', ')}).Count -gt $before){$true}} 1800
-    if(-not $confirmed){throw 'New message bubble not confirmed; do not retry automatically'}
-   }
-   @{sent=$true;confirmation='new_room_bubble'}
+   @{sent=$true;confirmation='draft_cleared'}
   }
   default {throw "Unknown action $($request.action)"}
  }
