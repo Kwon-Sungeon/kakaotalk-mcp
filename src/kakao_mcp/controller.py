@@ -401,36 +401,93 @@ def _matches_draft(edit, expected):
     return shown == expected and not _empty_input(edit, shown)
 
 
-def _paste_into_focused_input(hwnd, edit, room_name, expected, target):
+class _PasteError(RuntimeError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def _paste_into_focused_input(hwnd, edit, room_name, expected, target, replace_legacy_hint):
+    def verify_target():
+        if target:
+            target.verify()
+        if (find_chat_window(room_name) != hwnd
+                or find_child_window_recursive(hwnd, config.KAKAO_EDIT_CLASS) != edit
+                or not win32gui.IsWindowEnabled(hwnd)):
+            raise _PasteError('room_changed', 'Room or input changed before paste')
+        _require_focus(hwnd, edit)
+
     bring_window_to_front(hwnd)
     _focus_control(hwnd, edit)
-    if target:
-        target.verify()
-    if find_chat_window(room_name) != hwnd or not _empty_input(edit):
-        return False
-    _require_focus(hwnd, edit)
+    verify_target()
+    literal_hint = None
+    shown = _edit_text(edit)
+    if not _empty_input(edit, shown):
+        if shown not in config.KAKAO_INPUT_PLACEHOLDERS:
+            raise _PasteError('draft_exists', 'Chat has an existing draft before paste')
+        # Some legacy builds remove the literal hint when the input is clicked,
+        # even if SetFocus alone left it visible. Never select or delete it.
+        _click_control(hwnd, edit)
+        verify_target()
+        if not _wait_until(lambda: _empty_input(edit), .4):
+            current = _edit_text(edit)
+            if current != shown:
+                raise _PasteError('draft_changed', 'Input changed after focus')
+            if not replace_legacy_hint or expected == shown:
+                raise _PasteError('input_hint_unresolved', 'Focused input contains the literal placeholder. '
+                                 'Only if the user verified the field was empty, retry with replace_legacy_hint=true '
+                                 'and a new request ID. The requested message must differ from the placeholder.')
+            literal_hint = shown
+
     snapshot = _plain_clipboard_snapshot()
     clip = win32clipboard
+    fmt = win32con.CF_UNICODETEXT
+    text = expected.replace('\n', '\r\n')
     clip.OpenClipboard()
     try:
         before = clip.GetClipboardSequenceNumber()
         clip.EmptyClipboard()
-        clip.SetClipboardText(expected.replace('\n', '\r\n'), win32con.CF_UNICODETEXT)
+        clip.SetClipboardText(text, fmt)
+        handle = clip.GetClipboardDataHandle(fmt)
+    finally:
+        clip.CloseClipboard()
+
+    # Closing publishes the data. Capture the sequence from the published
+    # clipboard, while verifying the same data object and text under the lock.
+    clip.OpenClipboard()
+    try:
+        if (not clip.IsClipboardFormatAvailable(fmt) or clip.GetClipboardDataHandle(fmt) != handle
+                or clip.GetClipboardData(fmt) != text):
+            raise _PasteError('clipboard_changed', 'Clipboard text was replaced before paste')
         after = clip.GetClipboardSequenceNumber()
     finally:
         clip.CloseClipboard()
+
     try:
-        if not _empty_input(edit) or clip.GetClipboardSequenceNumber() != after:
-            return False
+        verify_target()
+        current = _edit_text(edit)
+        if not _empty_input(edit, current):
+            if current != literal_hint:
+                raise _PasteError('draft_changed', 'Input changed while preparing paste')
+            # Select only the verified placeholder in this HWND. Never send Ctrl+A globally.
+            win32gui.SendMessageTimeout(edit, win32con.EM_SETSEL, 0, -1, win32con.SMTO_ABORTIFHUNG, 500)
+            if _edit_text(edit) != literal_hint:
+                raise _PasteError('draft_changed', 'Input changed during placeholder selection')
+        if clip.GetClipboardSequenceNumber() != after:
+            raise _PasteError('clipboard_changed', 'Clipboard changed after text was published')
         _require_focus(hwnd, edit)
         _send_ctrl_key_combo(0x56)
-        return bool(_wait_until(lambda: _matches_draft(edit, expected), 1.5))
+        if not _wait_until(lambda: _matches_draft(edit, expected), 1.5):
+            raise _PasteError('paste_text_mismatch', 'Pasted text was not observed in the verified input; Enter was not issued')
     finally:
         _restore_plain_clipboard(snapshot, before, after)
+    # A placeholder which disappeared on click may be materialized again after
+    # Enter. It is distinct evidence of clearing only for a different payload.
+    return shown if shown in config.KAKAO_INPUT_PLACEHOLDERS and shown != expected else None
 
 
 @operation()
-def send_message_to_room(room_name: str, text: str, *, target=None) -> Dict:
+def send_message_to_room(room_name: str, text: str, *, target=None, replace_legacy_hint=False) -> Dict:
     """Send a text message to a KakaoTalk chat room.
 
     Use the native send button when identifiable. Buttonless clients need a
@@ -458,12 +515,11 @@ def send_message_to_room(room_name: str, text: str, *, target=None) -> Dict:
     button = _native_send_button(hwnd, include_disabled=True) or _native_send_button(hwnd, custom=True, include_disabled=True)
     if not button:
         try:
-            ready = _paste_into_focused_input(hwnd, edit_hwnd, room_name, expected, target)
+            hint = _paste_into_focused_input(hwnd, edit_hwnd, room_name, expected, target, replace_legacy_hint)
         except Exception as error:
-            return {"success": False, "status": "failed_before_send", "code": "input_not_ready", "error": str(error)}
-        if not ready:
-            return {"success": False, "status": "failed_before_send", "code": "draft_changed", "error": "Paste target or draft not verified"}
-        return _submit_draft(room_name, hwnd, edit_hwnd, expected, target)
+            return {"success": False, "status": "failed_before_send",
+                    "code": getattr(error, "code", "input_not_ready"), "error": str(error)}
+        return _submit_draft(room_name, hwnd, edit_hwnd, expected, target, literal_hint=hint)
     if not _empty_input(edit_hwnd, shown):
         return {"success": False, "status": "failed_before_send", "code": "draft_exists", "error": "Chat has an existing draft"}
     # EM_REPLACESEL goes to this Rich Edit and updates its change listeners.
@@ -481,7 +537,7 @@ def send_message_to_room(room_name: str, text: str, *, target=None) -> Dict:
     return _submit_draft(room_name, hwnd, edit_hwnd, expected, target)
 
 
-def _submit_draft(room_name, hwnd, edit_hwnd, expected, target=None):
+def _submit_draft(room_name, hwnd, edit_hwnd, expected, target=None, *, literal_hint=None):
     if target:
         target.verify()
     button = _native_send_button(hwnd)
@@ -489,7 +545,7 @@ def _submit_draft(room_name, hwnd, edit_hwnd, expected, target=None):
         if find_chat_window(room_name) != hwnd or not _matches_draft(edit_hwnd, expected):
             return {"success": False, "status": "failed_before_send", "code": "draft_changed", "error": "Chat draft changed before send"}
         win32gui.SendMessageTimeout(button, win32con.BM_CLICK, 0, 0, win32con.SMTO_ABORTIFHUNG, 1000)
-        return _sent_when_cleared(edit_hwnd, room_name)
+        return _sent_when_cleared(edit_hwnd, room_name, literal_hint)
 
     custom_button = _native_send_button(hwnd, custom=True)
     if custom_button:
@@ -502,7 +558,7 @@ def _submit_draft(room_name, hwnd, edit_hwnd, expected, target=None):
         point = ((height // 2) << 16) | (width // 2)
         for msg, keys in [(win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON), (win32con.WM_LBUTTONUP, 0)]:
             win32gui.SendMessageTimeout(custom_button, msg, keys, point, win32con.SMTO_ABORTIFHUNG, 1000)
-        return _sent_when_cleared(edit_hwnd, room_name)
+        return _sent_when_cleared(edit_hwnd, room_name, literal_hint)
 
     bring_window_to_front(hwnd)
     _focus_control(hwnd, edit_hwnd)
@@ -522,11 +578,15 @@ def _submit_draft(room_name, hwnd, edit_hwnd, expected, target=None):
         # explicitly so a foreground switch cannot send into another application.
         win32gui.PostMessage(edit_hwnd, win32con.WM_KEYDOWN, config.VK_RETURN, 0x001C0001)
         win32gui.PostMessage(edit_hwnd, win32con.WM_KEYUP, config.VK_RETURN, 0xC01C0001)
-    return _sent_when_cleared(edit_hwnd, room_name)
+    return _sent_when_cleared(edit_hwnd, room_name, literal_hint)
 
 
-def _sent_when_cleared(edit, room):
-    if _wait_until(lambda: _empty_input(edit), 2):
+def _sent_when_cleared(edit, room, literal_hint=None):
+    def cleared():
+        shown = _edit_text(edit)
+        return shown == literal_hint or _empty_input(edit, shown)
+
+    if _wait_until(cleared, 2):
         return {"success": True, "confirmation": "draft_cleared", "message": f"Message sent to '{room}'"}
     return {"success": False, "error": "Send not confirmed: the draft did not clear. Check the room; "
             "do not retry automatically. If KakaoTalk uses Ctrl+Enter set KAKAO_LEGACY_SEND_KEY=ctrl_enter."}

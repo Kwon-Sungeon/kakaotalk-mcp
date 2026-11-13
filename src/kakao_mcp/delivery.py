@@ -97,7 +97,7 @@ def file_clipboard(path):
         legacy._restore_plain_clipboard(snapshot, before, after)
 
 
-def dispatch(room, kind, value, mention):
+def dispatch(room, kind, value, mention, *, replace_legacy_hint=False):
     args = room.arguments()
     if kind in ('file', 'file_clipboard', 'file_picker'):
         if kind == 'file_picker' and room.is_qt:
@@ -125,7 +125,7 @@ def dispatch(room, kind, value, mention):
         return legacy.send_image_to_room(room.name, value, target=room)
     if kind == 'mention':
         return legacy.send_mention_message(room.name, mention, value, target=room)
-    return legacy.send_message_to_room(room.name, value, target=room)
+    return legacy.send_message_to_room(room.name, value, target=room, replace_legacy_hint=replace_legacy_hint)
 
 
 def _journal():
@@ -180,7 +180,7 @@ def send_policy():
 
 
 def deliver(kind, entries, *, mention=None, refs=None, request_id=None, interval=0, dry_run=False,
-            file_method='auto'):
+            file_method='auto', replace_legacy_hint=False):
     """Commit uncertainty before dispatch so termination cannot turn into a replay."""
     if kind in {'image', 'file'}:
         entries = [(room, os.fspath(value)) for room, value in entries]
@@ -269,7 +269,7 @@ def deliver(kind, entries, *, mention=None, refs=None, request_id=None, interval
                 db.execute('INSERT OR REPLACE INTO items VALUES (?,?,?)', (item, key, index))
                 save()
                 action = f'file_{file_method}' if kind == 'file' and file_method != 'auto' else kind
-                outcome = dispatch(room, action, value, mention)
+                outcome = dispatch(room, action, value, mention, replace_legacy_hint=replace_legacy_hint)
                 if not (outcome.get('sent') or outcome.get('success')):
                     row['status'] = outcome.get('status', 'unconfirmed')
                     raise DeliveryError(outcome.get('code', 'send_unconfirmed'), outcome.get('error', 'Send not confirmed'))

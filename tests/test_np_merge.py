@@ -267,47 +267,91 @@ def test_blank_keywords_are_rejected():
     assert result == {'success': False, 'error': 'Keywords list cannot be empty'}
 
 
-@pytest.mark.parametrize('literal_draft', [False, True])
-def test_buttonless_legacy_preserves_real_hint_text_and_targets_enter(monkeypatch, literal_draft):
+@pytest.mark.parametrize('scenario,code', [
+    ('sequence_at_close', None), ('focus_clears_hint', None), ('literal_draft', 'input_hint_unresolved'),
+    ('verified_hint', None), ('hint_is_payload', 'input_hint_unresolved'),
+    ('different_draft', 'draft_changed'), ('room_change', 'room_changed'),
+    ('same_text_new_clip', 'clipboard_changed'), ('clipboard_race', 'clipboard_changed'),
+    ('paste_not_applied', 'paste_text_mismatch'),
+])
+def test_buttonless_paste_and_exact_submission(monkeypatch, scenario, code):
     import win32con
     cue = '메시지 입력'
-    state = {'draft': cue}
+    expected = cue if scenario == 'hint_is_payload' else '테스트\n본문'
+    literal = scenario in {'focus_clears_hint', 'literal_draft', 'verified_hint', 'hint_is_payload', 'different_draft'}
+    state = {'draft': cue, 'clip': 'previous', 'seq': 10, 'writing': False, 'open': False, 'handle': 1}
     for name in ('bring_window_to_front', '_focus_control', '_require_focus'):
         monkeypatch.setattr(controller, name, Mock())
-    monkeypatch.setattr(controller, 'find_chat_window', lambda _: 11)
+    def click(*args):
+        if scenario == 'focus_clears_hint':
+            state['draft'] = ''
+    monkeypatch.setattr(controller, '_click_control', click)
+    monkeypatch.setattr(controller, '_wait_until', lambda check, timeout: check())
+    monkeypatch.setattr(controller, 'find_chat_window',
+                        lambda _: 99 if scenario == 'room_change' and state['seq'] != 10 else 11)
     monkeypatch.setattr(controller, 'find_child_window_recursive', lambda *_: 22)
     monkeypatch.setattr(controller, '_native_send_button', lambda *_, **__: None)
     monkeypatch.setattr(controller, '_edit_text', lambda _: state['draft'])
-    controller.win32gui.SendMessageTimeout.return_value = (1, len(cue) if literal_draft else 0)
+    def edit_message(edit, msg, w, l, *args):
+        assert edit == 22
+        if msg == win32con.EM_SETSEL:
+            assert scenario == 'verified_hint' and state['draft'] == cue and (w, l) == (0, -1)
+            state['selected'] = True
+            return (1, 0)
+        assert msg == win32con.EM_LINELENGTH
+        return (1, len(cue) if literal else 0)
+    controller.win32gui.SendMessageTimeout.side_effect = edit_message
     monkeypatch.setattr(controller, '_plain_clipboard_snapshot', lambda: (10, 'previous'))
     restore = Mock()
     monkeypatch.setattr(controller, '_restore_plain_clipboard', restore)
     clip = controller.win32clipboard
-    clip.GetClipboardSequenceNumber.side_effect = [10, 11, 11]
-
+    def open_clip():
+        assert not state['open']
+        state['open'] = True
+    def close_clip():
+        assert state['open']
+        state['open'] = False
+        if state['writing']:
+            state['seq'] = 12  # Win32 publishes synthesized formats on close.
+            state['writing'] = False
+            if scenario == 'same_text_new_clip':
+                state['handle'] += 1
+            if scenario == 'different_draft':
+                state['draft'] = 'new private draft'
+        elif scenario == 'clipboard_race':
+            state['seq'] += 1
+    def write_clip(text, fmt):
+        assert state['open'] and fmt == win32con.CF_UNICODETEXT
+        state.update(clip=text, seq=11, writing=True)
+    clip.OpenClipboard.side_effect = open_clip
+    clip.CloseClipboard.side_effect = close_clip
+    clip.SetClipboardText.side_effect = write_clip
+    clip.GetClipboardSequenceNumber.side_effect = lambda: state['seq']
+    clip.GetClipboardDataHandle.side_effect = lambda _: state['handle']
+    clip.GetClipboardData.side_effect = lambda _: state['clip']
     def paste(key):
-        assert key == 0x56
-        state['draft'] = clip.SetClipboardText.call_args.args[0].replace('\r\n', '\n')
-
+        assert key == 0x56 and not state['open'] and (not literal or state['draft'] == '' or state.get('selected'))
+        if scenario != 'paste_not_applied':
+            state['draft'] = state['clip'].replace('\r\n', '\n')
     def submit(edit, msg, key, flags):
-        assert edit == 22 and key == win32con.VK_RETURN and state['draft'] == 'first\nsecond'
+        assert edit == 22 and key == win32con.VK_RETURN and state['draft'] == expected
         if msg == win32con.WM_KEYUP:
             state['draft'] = cue
-
     key = Mock(side_effect=paste)
     monkeypatch.setattr(controller, '_send_ctrl_key_combo', key)
     controller.win32gui.PostMessage.side_effect = submit
-    result = controller.send_message_to_room('fixture', 'first\nsecond')
-    if literal_draft:
-        assert result['status'] == 'failed_before_send' and state['draft'] == cue
-        clip.OpenClipboard.assert_not_called()
+    result = controller.send_message_to_room('fixture', expected,
+                    replace_legacy_hint=scenario in {'verified_hint', 'different_draft', 'hint_is_payload'})
+    if code:
+        assert result['status'] == 'failed_before_send' and result['code'] == code
         controller.win32gui.PostMessage.assert_not_called()
-        key.assert_not_called()
+        if scenario != 'paste_not_applied':
+            key.assert_not_called()
     else:
         assert result['confirmation'] == 'draft_cleared'
         key.assert_called_once_with(0x56)
         assert controller.win32gui.PostMessage.call_count == 2
-        restore.assert_called_once_with((10, 'previous'), 10, 11)
+        restore.assert_called_once_with((10, 'previous'), 10, 12)
 
 
 def test_multiple_account_caches_require_selection(monkeypatch, tmp_path):

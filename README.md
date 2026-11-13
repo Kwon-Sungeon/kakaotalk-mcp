@@ -46,20 +46,20 @@ Codex, Claude Desktop, Claude Code 등 MCP 클라이언트에서 카카오톡 �
 
 ## 설치
 
-v0.6.0은 구형 Win32와 신형 Qt 카카오톡을 함께 지원합니다. 아래 명령은 GitHub Release의 공통 패키지를 사용합니다.
+v0.6.1은 구형 Win32와 신형 Qt 카카오톡을 함께 지원합니다. 아래 명령은 GitHub Release의 공통 패키지를 사용합니다.
 
 ### uvx
 
 별도 설치 없이 바로 실행:
 
 ```bash
-uvx --from https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.6.0/kakaotalk_mcp-0.6.0-py3-none-any.whl python -m kakao_mcp
+uvx --from https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.6.1/kakaotalk_mcp-0.6.1-py3-none-any.whl python -m kakao_mcp
 ```
 
 ### pip
 
 ```bash
-python -m pip install "https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.6.0/kakaotalk_mcp-0.6.0-py3-none-any.whl"
+python -m pip install "https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.6.1/kakaotalk_mcp-0.6.1-py3-none-any.whl"
 ```
 
 ### 소스에서 설치
@@ -78,12 +78,12 @@ py -m venv .venv
 기존에 특정 버전으로 등록한 wheel URL은 자동 업데이트되지 않습니다. uv가 설치된 PC에서는 PowerShell에서 아래 명령으로 등록한 뒤 Codex를 다시 열고 새 대화에서 확인하세요.
 
 ```powershell
-$wheel = 'https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.6.0/kakaotalk_mcp-0.6.0-py3-none-any.whl'
+$wheel = 'https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.6.1/kakaotalk_mcp-0.6.1-py3-none-any.whl'
 codex mcp add kakao -- uvx --from $wheel python -m kakao_mcp
 uvx --from $wheel python -m kakao_mcp --diagnose
 ```
 
-진단 명령은 카카오톡 버전, 선택된 백엔드(`win32` 또는 `qt_uia`), 열린 방 수, 조회 시간을 출력합니다. 방 이름과 대화 내용은 출력하지 않으며 전송하지 않습니다. 새 대화에서 `kakao_health_check(diagnostics=true)`가 0.6.0을 보고하는지 확인하세요. 도구 자체가 없으면 카카오톡 UI 문제가 아니라 MCP 등록/연결 문제부터 확인합니다.
+진단 명령은 카카오톡 버전, 선택된 백엔드(`win32` 또는 `qt_uia`), 열린 방 수, 조회 시간을 출력합니다. 방 이름과 대화 내용은 출력하지 않으며 전송하지 않습니다. 새 대화에서 `kakao_health_check(diagnostics=true)`가 0.6.1을 보고하는지 확인하세요. 도구 자체가 없으면 카카오톡 UI 문제가 아니라 MCP 등록/연결 문제부터 확인합니다.
 
 소스 설치에서는 위 uvx 명령 대신 가상 환경의 절대 경로를 등록합니다.
 
@@ -102,7 +102,7 @@ Claude Desktop 개발자 설정에서 여는 `claude_desktop_config.json`의 `mc
   "mcpServers": {
     "kakao": {
       "command": "uvx",
-      "args": ["--from", "https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.6.0/kakaotalk_mcp-0.6.0-py3-none-any.whl", "python", "-m", "kakao_mcp"]
+      "args": ["--from", "https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.6.1/kakaotalk_mcp-0.6.1-py3-none-any.whl", "python", "-m", "kakao_mcp"]
     }
   }
 }
@@ -138,7 +138,7 @@ Claude Desktop 개발자 설정에서 여는 `claude_desktop_config.json`의 `mc
 Claude Code 설정에서 MCP 서버 추가:
 
 ```bash
-claude mcp add kakao -- uvx --from https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.6.0/kakaotalk_mcp-0.6.0-py3-none-any.whl python -m kakao_mcp
+claude mcp add kakao -- uvx --from https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.6.1/kakaotalk_mcp-0.6.1-py3-none-any.whl python -m kakao_mcp
 ```
 
 또는 `.claude/settings.json`에 직접 추가:
@@ -148,7 +148,7 @@ claude mcp add kakao -- uvx --from https://github.com/Kwon-Sungeon/kakaotalk-mcp
   "mcpServers": {
     "kakao": {
       "command": "uvx",
-      "args": ["--from", "https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.6.0/kakaotalk_mcp-0.6.0-py3-none-any.whl", "python", "-m", "kakao_mcp"]
+      "args": ["--from", "https://github.com/Kwon-Sungeon/kakaotalk-mcp/releases/download/v0.6.1/kakaotalk_mcp-0.6.1-py3-none-any.whl", "python", "-m", "kakao_mcp"]
     }
   }
 }
@@ -186,6 +186,7 @@ Claude에게 자연어로 요청하면 됩니다:
 - 요청 ID를 생략하면 같은 요청에 대해 자동 ID를 사용합니다. 60초 이내에 같은 내용을 다시 요청하면 이전 확인 결과를 사용합니다. 미확인 항목은 다른 요청 ID로도 다시 보내지 않습니다. 사용자가 실제 방을 확인한 뒤에만 `kakao_delivery_status(request_id, item_index, user_verified)`로 `sent` 또는 `not_sent`를 기록하세요. 확인된 미전송 건은 새 요청으로 보낼 수 있습니다. 기록은 현재 Windows 사용자 프로필의 `%LOCALAPPDATA%\KakaoTalk-MCP\deliveries.sqlite3`에 저장됩니다.
 - 구형 멘션은 기존 초안을 보존하고 후보와 선택 결과를 확인한 뒤 전송합니다. 접근성 정보가 부족한 빌드는 입력 중 멈출 수 있습니다. 사진 전송도 채팅방에 속한 사진 미리보기와 전송 버튼을 확인해야 진행합니다.
 - 일반 파일은 `kakao_send_file`에 절대 경로 목록을 전달합니다. 신형은 방의 입력란에 파일을 붙여넣고, 구형은 기본적으로 방 소유의 파일 선택 창을 사용합니다. 구형에서 파일 붙여넣기를 지정하려면 `method="clipboard"`를 사용하세요. 첨부를 시작해도 카카오톡의 후속 확인 화면을 식별하지 못하면 미확인으로 중단합니다. 이때 같은 파일을 다시 보내기 전 해당 방을 확인하세요.
+- 구형 텍스트 전송에서 `input_hint_unresolved`가 반환되면 포커스를 준 뒤에도 입력란이 안내 문구 전체를 텍스트로 반환한 상태입니다. 사용자가 실제로 입력란이 비어 있다고 확인한 경우, `kakao_send_message`에 `replace_legacy_hint=true`를 지정해 그 문구만 교체할 수 있습니다. 이전 요청이 `failed_before_send`로 끝났다면 새 `request_id`를 사용하세요. `clipboard_changed`는 게시한 클립보드가 바뀐 경우, `paste_text_mismatch`는 붙여넣은 뒤 본문이 일치하지 않은 경우이며 두 경우 모두 Enter를 누르기 전에 중단됩니다.
 - 구형에서 전송 키 설정이 Ctrl+Enter라면 MCP 서버 환경 변수 `KAKAO_LEGACY_SEND_KEY=ctrl_enter`를 지정하세요. 작성란이 비워지지 않으면 성공 처리하지 않습니다.
 - Qt 일반 텍스트 전송은 해당 방의 UIA 입력란과 전송 버튼을 사용합니다. 기존 초안이 있거나 본문이 달라지면 중단합니다.
 - 이미 열린 방을 `kakao_open_room`으로 지정하면 작업 중인 창을 유지합니다. 방을 화면 앞으로 가져오려면 `focus=true`를 지정합니다. Qt에서 닫힌 방 검색과 사진 열기는 UIA 호출을 먼저 시도하고, 대상 창이 열리지 않을 때 클릭합니다.

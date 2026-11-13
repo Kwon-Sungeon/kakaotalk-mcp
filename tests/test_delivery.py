@@ -177,3 +177,12 @@ def test_file_method_switch_preserves_item_fence_and_filtered_log(fake, tmp_path
     first = next(row for row in rows if row['request_id'] == 'first')
     assert first['status'] == 'unconfirmed'
     assert set(first) == {'request_id', 'item_index', 'room', 'status', 'updated_unix'}
+
+
+def test_explicit_legacy_hint_does_not_bypass_a_previous_uncertain_send(fake):
+    fake.side_effect = RuntimeError('transport lost')
+    assert server.kakao_send_message('fixture', '테스트', request_id='first')['code'] == 'send_unconfirmed'
+    assert server.kakao_send_message('fixture', '테스트', request_id='first', replace_legacy_hint=True)['replayed']
+    assert server.kakao_send_message('fixture', '테스트', request_id='second',
+                                     replace_legacy_hint=True)['code'] == 'previous_send_unconfirmed'
+    fake.assert_called_once()

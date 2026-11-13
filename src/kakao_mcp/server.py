@@ -125,10 +125,12 @@ def kakao_open_room(room_name: str, focus: bool = False) -> Dict:
 
 @tool
 def kakao_send_message(room_name: str, message: str, room_ref: Optional[str] = None,
-                       request_id: Optional[str] = None, dry_run: bool = False) -> Dict:
-    """Open the exact room and send text once. Reuse request_id for retries; room_ref pins a previous open."""
+                       request_id: Optional[str] = None, dry_run: bool = False,
+                       replace_legacy_hint: bool = False) -> Dict:
+    """Send to one exact room. Reuse request_id for retries. Use replace_legacy_hint only when the user
+    verified that the legacy input showing its placeholder is empty. Never use it for an unknown draft."""
     return delivery.deliver('text', [(room_name, message)], refs={room_name: room_ref} if room_ref else None,
-                            dry_run=dry_run, request_id=request_id)
+                            dry_run=dry_run, request_id=request_id, replace_legacy_hint=replace_legacy_hint)
 
 
 @tool
