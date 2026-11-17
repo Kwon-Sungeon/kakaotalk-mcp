@@ -18,20 +18,27 @@ class WorkerError(RuntimeError):
 class Bridge:
     def __init__(self):
         self.process = None
+        self._script_mtime = None
 
     def close(self):
         process, self.process = self.process, None
+        self._script_mtime = None
         if process is None:
             return
         if process.poll() is None:
             process.kill()
         process.wait()
-        process.stdin.close()
-        process.stdout.close()
+        for stream in (process.stdin, process.stdout):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
     def start(self):
         # Explicit UTF-8 also works on PowerShell 5.1 machines with a different
         # ANSI code page. Keep scripts and chat text out of the command line.
+        # [IO.File]::ReadAllText strips any UTF-8 BOM automatically.
         command = (
             "[Console]::InputEncoding=[Console]::OutputEncoding=[Text.UTF8Encoding]::new();"
             "& ([scriptblock]::Create([IO.File]::ReadAllText($env:KAKAO_MCP_UIA_SCRIPT)))"
@@ -44,23 +51,34 @@ class Bridge:
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
 
+    def _current_script_mtime(self):
+        try:
+            return Path(__file__).with_name('qt_uia.ps1').stat().st_mtime_ns
+        except OSError:
+            return None
+
     def request(self, payload, timeout):
-        if self.process is None or self.process.poll() is not None:
+        script_mtime = self._current_script_mtime()
+        if (self.process is None or self.process.poll() is not None
+                or (self._script_mtime is not None and script_mtime != self._script_mtime)):
             self.close()
             self.process = self.start()
+            self._script_mtime = script_mtime
         process = self.process
         reply = Future()
 
         def exchange():
             try:
-                process.stdin.write(json.dumps(payload).encode('ascii') + b'\n')
+                process.stdin.write(json.dumps(payload, ensure_ascii=True).encode('ascii') + b'\n')
                 process.stdin.flush()
                 line = process.stdout.readline()
                 if not line:
                     raise RuntimeError('UI Automation worker closed its output')
-                reply.set_result(line)
+                if not reply.done():
+                    reply.set_result(line)
             except Exception as error:
-                reply.set_exception(error)
+                if not reply.done():
+                    reply.set_exception(error)
 
         # Bound pipe writes as well as reads if the provider or process hangs.
         threading.Thread(target=exchange, daemon=True).start()

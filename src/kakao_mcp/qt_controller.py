@@ -1,4 +1,5 @@
 """Qt KakaoTalk backend using Windows UI Automation and scoped keyboard input."""
+import ctypes
 import os
 from pathlib import Path
 import subprocess
@@ -35,6 +36,7 @@ def _qt_windows():
             # Unrelated protected processes and disappearing windows are normal.
             return
 
+    ctypes.windll.kernel32.SetLastError(0)
     win32gui.EnumWindows(visit, None)
     return windows
 
@@ -44,8 +46,14 @@ def call(action, **arguments):
         pids = {pid for pid, _, _ in _qt_windows()}
         if len(pids) != 1:
             raise RuntimeError(f'Expected one accessible Qt KakaoTalk process on this desktop, found {len(pids)}')
-        timeout = max(45, 15 * arguments.get('limit', 1)) if action == 'download' else (
-            10 if action in {'health', 'rooms', 'read'} else 20)
+        if action == 'download':
+            timeout = max(45, 15 * arguments.get('limit', 1))
+        elif action == 'read' and arguments.get('scroll_pages'):
+            timeout = max(20, 2 * int(arguments['scroll_pages']))
+        elif action in {'health', 'rooms', 'read', 'chats', 'close', 'inspect'}:
+            timeout = 10
+        else:
+            timeout = 20
         pid = pids.pop()
         if arguments.get('process_id', pid) != pid:
             raise RuntimeError('Target room process changed')
@@ -76,6 +84,22 @@ def find_chat_window(room_name):
     return rooms[0]['hwnd'] if rooms else None
 
 
+def close_chat_window(room_name):
+    return call('close', room=room_name)
+
+
+def list_chats():
+    return call('chats')
+
+
+def list_participants(room_name):
+    return call('participants', room=room_name)
+
+
+def inspect_ui(room_name="", max_depth=5):
+    return call('inspect', room=room_name, max_depth=max_depth)
+
+
 bring_window_to_front = legacy.bring_window_to_front
 
 
@@ -92,7 +116,8 @@ def send_message_to_room(room_name, text):
     return deliver('text', [(room_name, text)])
 
 
-def read_chat_messages(room_name, read_mode=None, max_messages=None, *, monitoring=False, all_history=False):
+def read_chat_messages(room_name, read_mode=None, max_messages=None, *, monitoring=False,
+                       all_history=False, scroll_pages: int = 0):
     mode = read_mode or os.environ.get('KAKAO_QT_READ_MODE', 'auto')
     if mode == 'uia':  # Existing installations used this name.
         mode = 'background'
@@ -100,15 +125,20 @@ def read_chat_messages(room_name, read_mode=None, max_messages=None, *, monitori
     if monitoring and mode == 'auto':
         mode = 'background'
     try:
+        if scroll_pages < 0:
+            raise ValueError('scroll_pages must be non-negative')
+        read_kwargs = {'room': room_name}
+        if scroll_pages > 0:
+            read_kwargs['scroll_pages'] = scroll_pages
         with operation():
             if mode not in {'auto', 'complete', 'background'}:
                 raise ValueError(f'Unknown read mode: {mode}')
             if mode == 'background':
-                return {'success': True, 'parsed': call('read', room=room_name)}
+                return {'success': True, 'parsed': call('read', **read_kwargs)}
             # A request for all links/history needs the full local copy. A
             # bounded read can use the exposed tail when it has enough detail.
             if mode == 'auto' and not all_history:
-                exposed = call('read', room=room_name)
+                exposed = call('read', **read_kwargs)
                 messages = exposed.get('messages', [])
                 if max_messages is None and messages and exposed.get('at_end') is not False:
                     if exposed.get('at_end') is None:

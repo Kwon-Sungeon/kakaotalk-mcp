@@ -322,3 +322,530 @@ def test_native_send_button_does_not_activate_window():
     controller.win32gui.SendMessageTimeout.assert_called_once_with(
         33, controller.win32con.BM_CLICK, 0, 0, controller.win32con.SMTO_ABORTIFHUNG, 1000)
     controller._user32.keybd_event.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# EnumWindows / EnumChildWindows transient error safety
+# ---------------------------------------------------------------------------
+
+def test_enum_windows_ignores_transient_win32_errors(monkeypatch):
+    import pywintypes
+
+    gui = controller.win32gui
+    gui.FindWindow.return_value = 10000
+    controller.win32process.GetWindowThreadProcessId.return_value = (0, 777)
+
+    def enum_side_effect(callback, _):
+        for hwnd in (20001, 20002, 20003):
+            callback(hwnd, None)
+
+    def is_visible(hwnd):
+        if hwnd == 20001:
+            raise pywintypes.error(1400, "IsWindowVisible", "Invalid window handle")
+        return True
+
+    def get_class(hwnd):
+        if hwnd == 20002:
+            raise pywintypes.error(1400, "GetClassName", "Invalid window handle")
+        return config.KAKAO_CHAT_WINDOW_CLASS
+
+    gui.EnumWindows.side_effect = enum_side_effect
+    gui.IsWindowVisible.side_effect = is_visible
+    gui.GetClassName.side_effect = get_class
+    gui.GetWindowText.return_value = "TargetRoom"
+
+    with patch.object(controller, "_is_chat_window", return_value=True):
+        assert controller.find_chat_window("TargetRoom") == 20003
+        rooms = controller.list_chat_windows()
+    assert rooms == [{"hwnd": 20003, "title": "TargetRoom"}]
+
+
+def test_find_child_window_recursive_distinguishes_early_stop_and_errors():
+    import pywintypes
+
+    gui = controller.win32gui
+
+    # Transient error on child 1, match + intentional early stop on child 2
+    def enum_early_stop(parent, cb, _):
+        assert cb(11, None) is True
+        assert cb(12, None) is False
+        raise pywintypes.error(0, "EnumChildWindows", "No error message is available")
+
+    def get_class(hwnd):
+        if hwnd == 11:
+            raise pywintypes.error(1400, "GetClassName", "Invalid window handle")
+        return "RICHEDIT50W"
+
+    gui.EnumChildWindows.side_effect = enum_early_stop
+    gui.GetClassName.side_effect = get_class
+    assert controller.find_child_window_recursive(10, "RICHEDIT50W") == 12
+
+    # Non-zero Win32 error when nothing was found returns None
+    gui.EnumChildWindows.side_effect = pywintypes.error(1400, "EnumChildWindows", "Invalid handle")
+    assert controller.find_child_window_recursive(10, "RICHEDIT50W") is None
+
+    # Unexpected non-Win32 error propagates when nothing was found
+    gui.EnumChildWindows.side_effect = RuntimeError("unexpected failure")
+    with pytest.raises(RuntimeError, match="unexpected failure"):
+        controller.find_child_window_recursive(10, "RICHEDIT50W")
+
+
+# ---------------------------------------------------------------------------
+# Mention non-Hangul & mixed typing
+# ---------------------------------------------------------------------------
+
+def test_send_unicode_char_uses_sendinput_utf16():
+    import ctypes
+
+    expected_size = 40 if ctypes.sizeof(ctypes.c_void_p) == 8 else 28
+    assert ctypes.sizeof(controller._INPUT) == expected_size
+
+    controller._user32.SendInput.return_value = 2
+    controller._send_unicode_char("A")
+    controller._user32.SendInput.assert_called_once()
+    count, arr, struct_size = controller._user32.SendInput.call_args.args
+    assert count == 2
+    assert struct_size == expected_size
+    assert arr[0].type == 1
+    assert arr[0].ki.wVk == 0
+    assert arr[0].ki.wScan == ord("A")
+    assert arr[0].ki.dwFlags == config.KEYEVENTF_UNICODE
+    assert arr[1].ki.dwFlags == (config.KEYEVENTF_UNICODE | config.KEYEVENTF_KEYUP)
+
+    # Non-BMP emoji produces surrogate pair (4 INPUT events)
+    controller._user32.SendInput.reset_mock()
+    controller._user32.SendInput.return_value = 4
+    controller._send_unicode_char("😀")
+    count2, arr2, _ = controller._user32.SendInput.call_args.args
+    assert count2 == 4
+    assert (arr2[0].ki.wScan, arr2[2].ki.wScan) == (0xD83D, 0xDE00)
+
+
+def test_type_mention_query_mixed_korean_english_digits_symbols(monkeypatch):
+    events = []
+    monkeypatch.setattr(controller, "_require_focus", lambda h, e: events.append(("focus", h, e)))
+    monkeypatch.setattr(controller, "_press_key", lambda vk, shift=False: events.append(("key", vk, shift)))
+    monkeypatch.setattr(controller, "_send_unicode_char", lambda ch: events.append(("unicode", ch)))
+
+    # Backward compatibility of _decompose_korean on Hangul syllables
+    assert controller._decompose_korean("김") == [(0x52, False), (0x4C, False), (0x41, False)]
+
+    controller._type_mention_query("김철수2_a", 100, 200)
+    keys = [item for item in events if item[0] == "key"]
+    unicodes = [item[1] for item in events if item[0] == "unicode"]
+    assert len(keys) == len(controller._decompose_korean("김철수"))
+    assert unicodes == ["2", "_", "a"]
+    assert events[0] == ("focus", 100, 200)
+
+    # Space uses VK_SPACE via _press_key
+    events.clear()
+    controller._type_mention_query("Alice B", 100, 200)
+    assert ("key", 0x20, False) in events
+    assert [item[1] for item in events if item[0] == "unicode"] == ["A", "l", "i", "c", "e", "B"]
+
+
+def test_send_mention_message_mixed_name(monkeypatch):
+    monkeypatch.setattr(controller, "find_chat_window", lambda _: 111)
+    monkeypatch.setattr(controller, "find_chat_input", lambda _: 222)
+    monkeypatch.setattr(controller, "bring_window_to_front", MagicMock())
+    monkeypatch.setattr(controller, "_focus_control", MagicMock())
+    monkeypatch.setattr(controller, "_require_focus", MagicMock())
+    monkeypatch.setattr(controller, "_replace_selection", MagicMock())
+    monkeypatch.setattr(controller, "_submit_draft", lambda *a, **kw: {"success": True})
+    monkeypatch.setattr(controller.time, "sleep", MagicMock())
+    monkeypatch.setattr(controller.bridge, "request", MagicMock(return_value={"selected": True}))
+    monkeypatch.setattr(controller, "_edit_text", MagicMock(side_effect=["", "", "@김철수2 "]))
+    monkeypatch.setattr(controller, "_wait_until", lambda check, _: check())
+
+    pressed = []
+    sent_unicode = []
+    monkeypatch.setattr(controller, "_press_key", lambda vk, shift=False: pressed.append((vk, shift)))
+    monkeypatch.setattr(controller, "_send_unicode_char", lambda ch: sent_unicode.append(ch))
+
+    res = controller.send_mention_message("Room", "김철수2", "안녕")
+    assert res["success"] is True
+    assert pressed[0] == (0x32, True)  # '@'
+    assert sent_unicode == ["2"]
+
+
+# ---------------------------------------------------------------------------
+# WIC image conversion & WebP fallback
+# ---------------------------------------------------------------------------
+
+def _make_synthetic_png_2x2() -> bytes:
+    import struct, zlib
+
+    def chunk(tag: bytes, payload: bytes) -> bytes:
+        return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", zlib.crc32(tag + payload) & 0xffffffff)
+
+    # Row 0: Red (255,0,0,255), Green (0,255,0,255)
+    # Row 1: Blue (0,0,255,255), White (255,255,255,255)
+    raw = (
+        b"\x00\xff\x00\x00\xff\x00\xff\x00\xff"
+        b"\x00\x00\x00\xff\xff\xff\xff\xff\xff"
+    )
+    ihdr = struct.pack(">IIBBBBB", 2, 2, 8, 6, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+
+
+def _make_synthetic_bmp_2x2() -> bytes:
+    import struct
+
+    # Bottom-up 24bpp BGR 2x2 BMP (each row padded to 4-byte boundary: 2*3=6 -> 8 bytes)
+    # Row 0 (bottom): Blue (255,0,0), White (255,255,255)
+    # Row 1 (top):    Red (0,0,255),  Green (0,255,0)
+    pixels = (
+        b"\xff\x00\x00\xff\xff\xff\x00\x00"
+        b"\x00\x00\xff\x00\xff\x00\x00\x00"
+    )
+    info = struct.pack("<IiiHHIIiiII", 40, 2, 2, 1, 24, 0, len(pixels), 0, 0, 0, 0)
+    file_hdr = struct.pack("<2sIHHI", b"BM", 14 + len(info) + len(pixels), 0, 0, 14 + len(info))
+    return file_hdr + info + pixels
+
+
+def test_wic_image_file_to_dib_synthetic_png_and_bmp(tmp_path):
+    import struct
+
+    png_path = tmp_path / "sample.png"
+    png_path.write_bytes(_make_synthetic_png_2x2())
+
+    dib_png = controller._image_file_to_dib_wic(str(png_path))
+    assert len(dib_png) == 40 + 2 * 2 * 4
+    hdr = struct.unpack("<IiiHHIIiiII", dib_png[:40])
+    assert hdr[:7] == (40, 2, 2, 1, 32, 0, 16)
+    # Bottom-up BGRA: bottom row first (Blue, White), then top row (Red, Green)
+    expected_pixels = bytes([
+        255, 0, 0, 255, 255, 255, 255, 255,
+        0, 0, 255, 255, 0, 255, 0, 255,
+    ])
+    assert dib_png[40:] == expected_pixels
+
+    bmp_path = tmp_path / "sample.bmp"
+    bmp_path.write_bytes(_make_synthetic_bmp_2x2())
+    dib_bmp = controller._image_file_to_dib_wic(str(bmp_path))
+    assert len(dib_bmp) == 40 + 16
+    assert dib_bmp[40:] == expected_pixels
+
+
+def test_copy_image_to_clipboard_uses_wic_without_powershell(tmp_path, monkeypatch):
+    png_path = tmp_path / "fast.png"
+    png_path.write_bytes(_make_synthetic_png_2x2())
+
+    mock_run = MagicMock(side_effect=AssertionError("PowerShell should not be spawned when WIC succeeds"))
+    monkeypatch.setattr(controller.subprocess, "run", mock_run)
+
+    captured = {}
+
+    def set_data(fmt, data):
+        captured["fmt"] = fmt
+        captured["data"] = data
+
+    controller.win32clipboard.SetClipboardData.side_effect = set_data
+    controller.win32clipboard.GetClipboardData.side_effect = lambda _: captured["data"]
+    controller.win32clipboard.GetClipboardSequenceNumber.return_value = 99
+
+    seq = controller._copy_image_to_clipboard(str(png_path))
+    assert seq == 99
+    assert len(captured["data"]) == 56
+    mock_run.assert_not_called()
+
+
+def test_image_to_dib_webp_fallback_and_safe_stderr_decode(tmp_path, monkeypatch):
+    webp_path = tmp_path / "sticker.webp"
+    webp_path.write_bytes(b"RIFF\x00\x00\x00\x00WEBP")
+
+    monkeypatch.setattr(controller, "_image_file_to_dib_wic", MagicMock(side_effect=OSError("no codec")))
+    fake_bmp = b"BM" + b"\x00" * 12 + b"\x00" * 40 + b"\x01" * 16
+    mock_run = MagicMock(return_value=MagicMock(returncode=0, stdout=fake_bmp, stderr=b""))
+    monkeypatch.setattr(controller.subprocess, "run", mock_run)
+
+    dib = controller._image_to_dib(str(webp_path))
+    assert dib == fake_bmp[14:]
+    ps_cmd = mock_run.call_args[0][0][3]
+    assert "Windows.Graphics.Imaging.BitmapDecoder" in ps_cmd
+
+    # Non-UTF8 invalid bytes in stderr must never raise UnicodeDecodeError
+    mock_run.return_value = MagicMock(returncode=1, stdout=b"", stderr=b"\xff\xfe\x80\x81failed")
+    with pytest.raises(OSError, match="Failed to convert image to BMP"):
+        controller._image_to_dib(str(webp_path))
+
+
+# ---------------------------------------------------------------------------
+# Faster clipboard polling, scroll_pages, close_chat_window, inspect_win32_tree,
+# and list_participants_legacy
+# ---------------------------------------------------------------------------
+
+def test_read_messages_clipboard_polling_and_scroll_pages(monkeypatch):
+    monkeypatch.setattr(controller, "find_chat_window", lambda _: 11111)
+    monkeypatch.setattr(controller, "find_child_window_recursive", lambda *_: 33333)
+    monkeypatch.setattr(controller, "bring_window_to_front", MagicMock())
+    monkeypatch.setattr(controller, "_focus_control", MagicMock())
+    monkeypatch.setattr(controller, "_require_focus", MagicMock())
+    monkeypatch.setattr(controller, "_send_ctrl_key_combo", MagicMock())
+    monkeypatch.setattr(controller, "_read_clipboard_text", lambda: "[Room] [대화상대 2명]\n[A] [오전 10:00] Old")
+    monkeypatch.setattr(controller.time, "sleep", MagicMock())
+    controller.win32clipboard.CountClipboardFormats.return_value = 0
+    # Simulates 2 polling misses before KakaoTalk publishes clipboard sequence 2
+    controller.win32clipboard.GetClipboardSequenceNumber.side_effect = [1, 1, 1, 1, 2, 2, 2]
+
+    pressed = []
+    monkeypatch.setattr(controller, "_press_key", lambda vk, shift=False: pressed.append((vk, shift)))
+
+    res = controller.read_chat_messages("Room", "complete", scroll_pages=3)
+    assert res["success"] is True
+    assert "Old" in res["raw_text"]
+    assert pressed == [(config.VK_PRIOR, False)] * 3
+
+    # Background mode rejects scroll_pages > 0
+    bg_res = controller.read_chat_messages("Room", "background", scroll_pages=2)
+    assert bg_res["success"] is False
+    assert "background" in bg_res["error"].lower()
+
+
+def test_close_chat_window_safety_and_states(monkeypatch):
+    monkeypatch.setattr(controller, "find_chat_window", lambda name: 111 if name == "Room" else None)
+    controller.win32gui.IsWindowEnabled.return_value = False
+    busy = controller.close_chat_window("Room")
+    assert busy["success"] is False and busy["code"] == "room_busy"
+    controller.win32gui.PostMessage.assert_not_called()
+
+    controller.win32gui.IsWindowEnabled.return_value = True
+    controller.win32gui.IsWindow.side_effect = [True, False]
+    monkeypatch.setattr(controller, "_wait_until", lambda check, _: check() or check())
+    ok = controller.close_chat_window("Room")
+    assert ok["success"] is True and ok["closed"] is True
+    controller.win32gui.PostMessage.assert_called_once_with(111, config.WM_CLOSE, 0, 0)
+
+    # Not found
+    assert controller.close_chat_window("Missing")["success"] is False
+
+
+def test_inspect_win32_tree_hierarchy_and_depth(monkeypatch):
+    monkeypatch.setattr(controller, "find_chat_window", lambda _: 100)
+    parents = {101: 100, 102: 101, 103: 102}
+    classes = {100: "EVA_Window_Dblclk", 101: "EVA_ChildWindow", 102: "RICHEDIT50W", 103: "DeepChild"}
+    titles = {100: "Room", 101: "Container", 102: "", 103: "Leaf"}
+
+    gui = controller.win32gui
+    gui.EnumChildWindows.side_effect = lambda root, cb, _: [cb(h, None) for h in (101, 102, 103)]
+    gui.GetParent.side_effect = lambda h: parents[h]
+    gui.GetClassName.side_effect = lambda h: classes[h]
+    gui.GetWindowText.side_effect = lambda h: titles[h]
+    gui.GetDlgCtrlID.side_effect = lambda h: h + 1000
+    gui.GetWindowRect.side_effect = lambda h: (0, 0, h, h)
+    gui.IsWindowVisible.return_value = True
+    gui.IsWindowEnabled.return_value = True
+
+    tree_full = controller.inspect_win32_tree("Room", max_depth=5)
+    assert tree_full["success"] is True
+    assert tree_full["node_count"] == 4
+    assert tree_full["tree"]["children"][0]["children"][0]["children"][0]["hwnd"] == 103
+
+    tree_shallow = controller.inspect_win32_tree("Room", max_depth=1)
+    assert tree_shallow["node_count"] == 2
+    assert tree_shallow["tree"]["children"][0]["children"] == []
+
+
+def test_list_participants_legacy_uia_and_fallback(monkeypatch):
+    monkeypatch.setattr(controller, "find_chat_window", lambda _: 100)
+    controller.win32process.GetWindowThreadProcessId.return_value = (1, 999)
+
+    monkeypatch.setattr(controller.bridge, "request", MagicMock(return_value={"participants": ["김철수", "이영희"]}))
+    ok = controller.list_participants_legacy("Room")
+    assert ok["success"] is True and ok["participants"] == ["김철수", "이영희"] and ok["count"] == 2
+
+    monkeypatch.setattr(controller.bridge, "request", MagicMock(side_effect=RuntimeError("Unknown action participants")))
+    monkeypatch.setattr(controller, "find_child_window_recursive", lambda *_: 200)
+    monkeypatch.setattr(controller, "_edit_text", lambda _: "[Room] [대화상대 5명]\n")
+    fb = controller.list_participants_legacy("Room")
+    assert fb["success"] is False and fb["participants"] == [] and fb["member_count"] == 5
+
+
+def test_list_chats_legacy_uses_ocr_worker(monkeypatch):
+    monkeypatch.setattr(controller, "_main_window", lambda: 100)
+    monkeypatch.setattr(controller, "_find_chat_list_view", lambda _: 200)
+    monkeypatch.setattr(controller, "_find_visible_chat_room_list", lambda _: 300)
+    controller.win32gui.IsWindowVisible.return_value = True
+    controller.win32process.GetWindowThreadProcessId.return_value = (1, 999)
+    monkeypatch.setattr(
+        controller.bridge,
+        "request",
+        MagicMock(return_value={"chats": [{"title": "RoomA"}, {"title": "RoomB"}], "read_method": "win32_ocr"}),
+    )
+    res = controller.list_chats_legacy(max_chats=1)
+    assert res["read_method"] == "win32_ocr"
+    assert res["total_exposed"] == 2
+    assert [c["title"] for c in res["chats"]] == ["RoomA"]
+
+
+def test_search_and_open_room_clears_only_own_query(monkeypatch):
+    monkeypatch.setattr(controller, "_main_window", lambda: 100)
+    monkeypatch.setattr(controller, "_ensure_foreground", lambda _: True)
+    monkeypatch.setattr(controller, "_activate_search_and_get_edit", lambda _: 200)
+    monkeypatch.setattr(controller, "_find_chat_list_view", lambda _: 300)
+    monkeypatch.setattr(controller, "_find_visible_search_list", lambda _: 400)
+    monkeypatch.setattr(controller, "_wait_until", lambda check, _: check())
+    controller.win32process.GetWindowThreadProcessId.return_value = (1, 999)
+    replaced = []
+    monkeypatch.setattr(controller, "_replace_selection", lambda _, txt: replaced.append(txt))
+    texts = iter(["", "김민수", "김민수", "김민수"])
+    monkeypatch.setattr(controller, "_edit_text", lambda _: next(texts))
+    monkeypatch.setattr(controller.bridge, "request", MagicMock(return_value={"opened": True}))
+    monkeypatch.setattr(controller, "find_chat_window", lambda _: 555)
+    res = controller.search_and_open_room("김민수")
+    assert res["success"] is True and res["hwnd"] == 555
+    assert replaced == ["김민수", ""]
+
+
+def test_send_prepared_image_win32_fallback(monkeypatch):
+    controller.win32gui.IsWindowEnabled.return_value = True
+    monkeypatch.setattr(controller, "find_chat_window", lambda _: 111)
+    controller.win32process.GetWindowThreadProcessId.return_value = (1, 999)
+    monkeypatch.setattr(controller, "_focus_control", MagicMock())
+    monkeypatch.setattr(controller, "_require_focus", MagicMock())
+    monkeypatch.setattr(controller, "_empty_input", lambda _: True)
+    controller.win32clipboard.GetClipboardSequenceNumber.return_value = 7
+    monkeypatch.setattr(controller.bridge, "request", MagicMock(side_effect=RuntimeError("Unique enabled send button not found")))
+    monkeypatch.setattr(controller, "_find_owned_popup", lambda *_: 222)
+    monkeypatch.setattr(controller, "_native_send_button", lambda popup, custom=False: 333 if custom else None)
+    controller.win32gui.GetClientRect.return_value = (0, 0, 80, 30)
+    controller.win32gui.IsWindowVisible.return_value = False
+    monkeypatch.setattr(controller, "_wait_until", lambda check, _: check())
+    res = controller._send_prepared_image(111, 444, 7, "Room", "C:\\x.png")
+    assert res["success"] is True and res["confirmation"] == "verified_photo_preview_closed"
+
+
+def test_read_messages_handles_null_clipboard_owner_error(monkeypatch):
+    import pywintypes
+    monkeypatch.setattr(controller, "find_chat_window", lambda _: 111)
+    monkeypatch.setattr(controller, "find_child_window_recursive", lambda *_: 222)
+    monkeypatch.setattr(controller, "bring_window_to_front", MagicMock())
+    monkeypatch.setattr(controller, "_wait_until", lambda check, _: check())
+    monkeypatch.setattr(controller, "_focus_control", MagicMock())
+    monkeypatch.setattr(controller, "_require_focus", MagicMock())
+    monkeypatch.setattr(controller, "_send_ctrl_key_combo", MagicMock())
+    monkeypatch.setattr(controller, "_plain_clipboard_snapshot", lambda: (1, ""))
+    monkeypatch.setattr(controller.time, "sleep", lambda _: None)
+    controller.win32clipboard.GetClipboardSequenceNumber.side_effect = [1, 2]
+    controller.win32clipboard.GetClipboardOwner.side_effect = pywintypes.error(0, "GetClipboardOwner", "No error message is available")
+    res = controller.read_chat_messages("Room", "complete")
+    assert res["success"] is False and "fresh transcript" in res["error"]
+
+
+def test_open_clipboard_retries_transient_access_denied(monkeypatch):
+    import pywintypes
+    monkeypatch.setattr(controller.time, "sleep", lambda _: None)
+    calls = {"n": 0}
+
+    def flaky_open():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise pywintypes.error(5, "OpenClipboard", "Access is denied.")
+
+    controller.win32clipboard.OpenClipboard.side_effect = flaky_open
+    with controller._open_clipboard(timeout_sec=0.5, interval_sec=0.01):
+        pass
+    assert calls["n"] == 3
+    controller.win32clipboard.CloseClipboard.assert_called_once()
+
+
+def test_open_clipboard_raises_non_access_denied_immediately(monkeypatch):
+    import pywintypes
+    sleep = MagicMock()
+    monkeypatch.setattr(controller.time, "sleep", sleep)
+    controller.win32clipboard.OpenClipboard.side_effect = pywintypes.error(1418, "OpenClipboard", "Thread does not have a clipboard open.")
+    with pytest.raises(pywintypes.error):
+        with controller._open_clipboard(timeout_sec=0.5, interval_sec=0.01):
+            pass
+    sleep.assert_not_called()
+    controller.win32clipboard.CloseClipboard.assert_not_called()
+
+
+def test_send_image_allows_legacy_placeholder_cue_with_nonzero_length(monkeypatch):
+    import win32con
+    monkeypatch.setattr(controller.os.path, "isfile", lambda _: True)
+    monkeypatch.setattr(controller.os.path, "abspath", lambda p: p)
+    monkeypatch.setattr(controller, "find_chat_window", lambda _: 111)
+    monkeypatch.setattr(controller, "find_chat_input", lambda _: 222)
+    monkeypatch.setattr(controller, "bring_window_to_front", MagicMock())
+    monkeypatch.setattr(controller, "_focus_control", MagicMock())
+    monkeypatch.setattr(controller, "_require_focus", MagicMock())
+    monkeypatch.setattr(controller, "_edit_text", lambda _: "메시지 입력")
+    controller.win32gui.SendMessageTimeout.side_effect = lambda h, m, *_: (1, 6) if m == win32con.EM_LINELENGTH else (1, 0)
+    controller.win32gui.IsWindowEnabled.return_value = True
+    monkeypatch.setattr(controller, "_copy_image_to_clipboard", lambda *a, **kw: 99)
+    monkeypatch.setattr(controller, "_restore_plain_clipboard", MagicMock())
+    controller.win32clipboard.GetClipboardSequenceNumber.return_value = 99
+    monkeypatch.setattr(controller.bridge, "request", MagicMock(return_value={"sent": True, "confirmation": "verified_photo_preview_closed"}))
+    res = controller.send_image_to_room("Room", "C:\\x.png")
+    assert res["success"] is True
+
+
+def test_send_mention_selects_legacy_placeholder_before_at(monkeypatch):
+    import win32con
+    monkeypatch.setattr(controller, "find_chat_window", lambda _: 111)
+    monkeypatch.setattr(controller, "find_chat_input", lambda _: 222)
+    monkeypatch.setattr(controller, "bring_window_to_front", MagicMock())
+    monkeypatch.setattr(controller, "_focus_control", MagicMock())
+    monkeypatch.setattr(controller, "_require_focus", MagicMock())
+    monkeypatch.setattr(controller, "_replace_selection", MagicMock())
+    monkeypatch.setattr(controller, "_submit_draft", lambda *a, **kw: {"success": True})
+    monkeypatch.setattr(controller.time, "sleep", MagicMock())
+    monkeypatch.setattr(controller.bridge, "request", MagicMock(return_value={"selected": True}))
+    monkeypatch.setattr(controller, "_edit_text", MagicMock(side_effect=["메시지 입력", "메시지 입력", "@김철수 "]))
+    monkeypatch.setattr(controller, "_wait_until", lambda check, _: check())
+    monkeypatch.setattr(controller, "_press_key", MagicMock())
+    monkeypatch.setattr(controller, "_type_mention_query", MagicMock())
+    calls = []
+
+    def send_msg(h, m, w, l, *rest):
+        calls.append((h, m, w, l))
+        return (1, 6) if m == win32con.EM_LINELENGTH else (1, 0)
+
+    controller.win32gui.SendMessageTimeout.side_effect = send_msg
+    res = controller.send_mention_message("Room", "김철수", "안녕")
+    assert res["success"] is True
+    assert (222, win32con.EM_SETSEL, 0, -1) in calls
+
+
+def test_inspect_win32_tree_includes_owned_popups(monkeypatch):
+    monkeypatch.setattr(controller, "find_chat_window", lambda _: 100)
+    gui = controller.win32gui
+    gui.EnumChildWindows.side_effect = lambda root, cb, _: [cb(201, None)] if root == 200 else []
+    gui.EnumWindows.side_effect = lambda cb, _: cb(200, None)
+    gui.GetWindow.side_effect = lambda h, cmd: 100 if h == 200 else 0
+    gui.GetParent.side_effect = lambda h: 200 if h == 201 else 0
+    gui.GetClassName.side_effect = lambda h: {100: "EVA_Window_Dblclk", 200: "#32770", 201: "Button"}[h]
+    gui.GetWindowText.side_effect = lambda h: {100: "Room", 200: "열기", 201: "열기(&O)"}[h]
+    gui.GetDlgCtrlID.side_effect = lambda h: 1 if h == 201 else 0
+    gui.GetWindowRect.return_value = (0, 0, 100, 100)
+    gui.IsWindowVisible.return_value = True
+    gui.IsWindowEnabled.side_effect = lambda h: h != 100
+    res = controller.inspect_win32_tree("Room", max_depth=3)
+    assert res["success"] is True and len(res["owned_popups"]) == 1
+    assert res["owned_popups"][0]["class"] == "#32770"
+    assert res["owned_popups"][0]["children"][0]["ctrl_id"] == 1
+
+
+def test_send_prepared_image_owner_drawn_ocr_fallback(monkeypatch):
+    controller.win32gui.IsWindowEnabled.return_value = True
+    monkeypatch.setattr(controller, "find_chat_window", lambda _: 111)
+    controller.win32process.GetWindowThreadProcessId.return_value = (1, 999)
+    monkeypatch.setattr(controller, "_focus_control", MagicMock())
+    monkeypatch.setattr(controller, "_require_focus", MagicMock())
+    monkeypatch.setattr(controller, "_empty_input", lambda _: True)
+    controller.win32clipboard.GetClipboardSequenceNumber.return_value = 7
+    monkeypatch.setattr(controller, "_find_owned_popup", lambda *_: 222)
+    monkeypatch.setattr(controller, "_native_send_button", lambda popup, custom=False: None)
+    calls = []
+
+    def fake_bridge(payload, timeout):
+        calls.append(payload["action"])
+        if payload["action"] == "legacy_image_confirm":
+            raise RuntimeError("Cannot verify photo preview in the exact room")
+        return {"sent": True, "confirmation": "verified_photo_preview_closed"}
+
+    monkeypatch.setattr(controller.bridge, "request", fake_bridge)
+    res = controller._send_prepared_image(111, 444, 7, "Room", "C:\\x.png")
+    assert res["success"] is True and res["confirmation"] == "verified_photo_preview_closed"
+    assert calls == ["legacy_image_confirm", "legacy_photo_ocr_confirm"]

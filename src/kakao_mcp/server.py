@@ -44,7 +44,13 @@ def tool(function):
             result.setdefault("code", delivery.error_code(result.get("error", "")))
         return CallToolResult(isError=failed, structuredContent=result,
                               content=[TextContent(type="text", text=json.dumps(result, ensure_ascii=False))])
-    local_reads = {'kakao_health_check', 'kakao_list_open_rooms', 'kakao_get_send_log'}
+    local_reads = {
+        'kakao_health_check',
+        'kakao_list_open_rooms',
+        'kakao_get_send_log',
+        'kakao_list_chats',
+        'kakao_inspect_ui',
+    }
     annotations = ToolAnnotations(readOnlyHint=True, openWorldHint=False) if function.__name__ in local_reads else None
     app.tool(structured_output=False, annotations=annotations)(invoke)
     return function
@@ -107,6 +113,37 @@ def kakao_list_open_rooms() -> Dict:
 
 
 @tool
+def kakao_list_chats(max_chats: int = 50) -> Dict:
+    """List recent/visible chat rooms from KakaoTalk's Chats tab (Qt UIA or legacy Win32 OCR)."""
+    if max_chats < 1:
+        return {"error": "max_chats must be positive", "code": "invalid_argument"}
+    from . import qt_controller, controller as legacy
+    if qt_controller.available():
+        data = qt_controller.list_chats()
+        all_chats = data.get("chats", [])
+        chats = all_chats[:max_chats]
+        return {
+            "message": f"Found {len(chats)} chat(s)",
+            "total_exposed": len(all_chats),
+            "chats": chats,
+            "read_method": "uia",
+            "partial": True,
+        }
+    with operation():
+        data = legacy.list_chats_legacy(max_chats)
+    if data.get("success") is False:
+        return data
+    chats = data.get("chats", [])
+    return {
+        "message": f"Found {len(chats)} chat(s)",
+        "total_exposed": data.get("total_exposed", len(chats)),
+        "chats": chats,
+        "read_method": data.get("read_method", "win32_ocr"),
+        "partial": True,
+    }
+
+
+@tool
 def kakao_open_room(room_name: str, focus: bool = False, self_only: bool = False) -> Dict:
     """Open a KakaoTalk chat room by name. An existing room keeps its position.
     Set focus=true when the user wants to see the room. On Qt, self_only verifies KakaoTalk’s self-chat label.
@@ -132,11 +169,51 @@ def kakao_open_room(room_name: str, focus: bool = False, self_only: bool = False
 
 
 @tool
+def kakao_close_room(room_name: str) -> Dict:
+    """Safely close an open KakaoTalk chat room window unless a modal dialog is open."""
+    if not room_name.strip():
+        return {"error": "room_name cannot be empty", "code": "invalid_argument"}
+    with operation():
+        from . import qt_controller, controller as legacy
+        if qt_controller.available():
+            res = qt_controller.close_chat_window(room_name)
+            return {"message": f"Closed '{room_name}'", **res}
+        return legacy.close_chat_window(room_name)
+
+
+@tool
+def kakao_list_participants(room_name: str) -> Dict:
+    """List participants in an open KakaoTalk chat room (read-only via drawer/UIA)."""
+    if not room_name.strip():
+        return {"error": "room_name cannot be empty", "code": "invalid_argument"}
+    with operation():
+        from . import qt_controller, controller as legacy
+        if qt_controller.available():
+            data = qt_controller.list_participants(room_name)
+            participants = data.get("participants", [])
+            count = data.get("count", len(participants))
+            return {"message": f"Found {count} participant(s) in '{room_name}'", **data}
+        return legacy.list_participants_legacy(room_name)
+
+
+@tool
+def kakao_inspect_ui(room_name: str = "", max_depth: int = 5) -> Dict:
+    """Dump a read-only Win32 or UIA control tree for diagnostics and UI calibration."""
+    if not 0 <= max_depth <= 10:
+        return {"error": "max_depth must be between 0 and 10", "code": "invalid_argument"}
+    with operation():
+        from . import qt_controller, controller as legacy
+        if qt_controller.available():
+            return qt_controller.inspect_ui(room_name, max_depth)
+        return legacy.inspect_win32_tree(room_name, max_depth)
+
+
+@tool
 def kakao_send_message(room_name: str, message: str, room_ref: Optional[str] = None,
                        request_id: Optional[str] = None, dry_run: bool = False,
-                       replace_legacy_hint: bool = False) -> Dict:
-    """Send to one exact room. Reuse request_id for retries. Use replace_legacy_hint only when the user
-    verified that the legacy input showing its placeholder is empty. Never use it for an unknown draft."""
+                       replace_legacy_hint: bool = True) -> Dict:
+    """Send to one exact room. Reuse request_id for retries. Non-placeholder drafts are always preserved;
+    set replace_legacy_hint=false to reject legacy inputs that still report the placeholder cue string."""
     return delivery.deliver('text', [(room_name, message)], refs={room_name: room_ref} if room_ref else None,
                             dry_run=dry_run, request_id=request_id, replace_legacy_hint=replace_legacy_hint)
 
@@ -183,11 +260,13 @@ def kakao_delivery_status(request_id: str, item_index: Optional[int] = None,
 
 @tool
 def kakao_read_messages(room_name: str, max_messages: Optional[int] = None, read_mode: Optional[ReadMode] = None,
-                        sender: Optional[str] = None, contains: Optional[str] = None) -> Dict:
+                        sender: Optional[str] = None, contains: Optional[str] = None,
+                        scroll_pages: int = 0) -> Dict:
     """Read recent messages from a KakaoTalk chat room.
     Reads locally loaded messages using the selected UI backend.
     With no count, auto prefers the exposed conversation (up to 50). Specify a
     count to fill missing history or metadata using a full copy when needed.
+    Use scroll_pages > 0 to scroll upward and load older visible history pages.
     Use background for exposed messages without input or clipboard, even if partial.
     Use complete for all locally loaded detail; it may activate the room and copy.
     partial indicates that server-only history may not be included.
@@ -195,24 +274,30 @@ def kakao_read_messages(room_name: str, max_messages: Optional[int] = None, read
     Args:
         room_name: Exact title of the chat room window.
         max_messages: Maximum number of recent messages to return (default 50).
+        scroll_pages: Number of upward scroll pages to load older messages (default 0).
     """
     try:
         if max_messages is not None and max_messages < 1:
             return {"error": "max_messages must be positive"}
-        result = controller.read_chat_messages(room_name, read_mode, max_messages)
+        if scroll_pages < 0:
+            return {"error": "scroll_pages must be non-negative"}
+        read_kwargs = {"scroll_pages": scroll_pages} if scroll_pages else {}
+        result = controller.read_chat_messages(room_name, read_mode, max_messages, **read_kwargs)
         if not result["success"]:
             return {"error": result["error"], "code": result.get("code", "read_failed")}
         parsed = result.get('parsed') or parser.parse_chat_text(result["raw_text"])
+        limit = max_messages if max_messages is not None else (None if scroll_pages > 0 else 50)
         if 'ocr_lines' in parsed:
             if sender:
                 return {"error": "OCR cannot identify senders. Use complete mode for a sender filter."}
             lines = [line for line in parsed['ocr_lines'] if not contains or contains.casefold() in line.casefold()]
-            return {**parsed, "ocr_lines": lines[-(max_messages or 50):],
+            if limit is not None:
+                lines = lines[-limit:]
+            return {**parsed, "ocr_lines": lines,
                     "message": "Visible OCR lines; message boundaries and senders are unknown"}
         messages = parser.filter_messages(parser.enrich_messages(parsed["messages"]), sender, contains)
-        max_messages = max_messages or 50
-        if len(messages) > max_messages:
-            messages = messages[-max_messages:]
+        if limit is not None and len(messages) > limit:
+            messages = messages[-limit:]
         return {
             "message": f"Read {len(messages)} messages from '{room_name}'",
             "room_name": parsed["room_name"],
@@ -306,7 +391,7 @@ def kakao_start_monitor(
     poll_interval_sec: float = 5.0,
     read_mode: Optional[ReadMode] = None,
 ) -> Dict:
-    """Start monitoring a KakaoTalk chat room for keyword matches.
+    """Start monitoring a KakaoTalk chat room for keyword matches (supports multiple concurrent rooms).
     Runs in background, checking for new messages at the specified interval.
     Use kakao_get_monitor_events() to retrieve detected keyword matches.
     Keep the room open. Qt auto monitors exposed UIA messages without input.
@@ -330,20 +415,24 @@ def kakao_start_monitor(
 
 
 @tool
-def kakao_stop_monitor() -> Dict:
-    """Stop the running chat room monitor."""
+def kakao_stop_monitor(room_name: Optional[str] = None) -> Dict:
+    """Stop monitoring a specific chat room, or all running monitors when room_name is omitted."""
     try:
-        result = controller._chat_monitor.stop()
+        monitor = controller._chat_monitor
+        result = monitor.stop(room_name) if room_name is not None else monitor.stop()
         if result["success"]:
-            return {"message": result["message"]}
+            out = {"message": result["message"]}
+            if "stopped_rooms" in result:
+                out["stopped_rooms"] = result["stopped_rooms"]
+            return out
         return {"error": result["error"]}
     except Exception as e:
         return {"error": f"Failed to stop monitor: {e}"}
 
 
 @tool
-async def kakao_get_monitor_events(wait_sec: float = 0) -> Dict:
-    """Get pending keyword match events from the chat monitor.
+async def kakao_get_monitor_events(wait_sec: float = 0, room_name: Optional[str] = None) -> Dict:
+    """Get pending keyword match events from the chat monitor (one room or all monitored rooms).
     Returns events detected since last call. Each event includes:
     - keyword: the matched keyword
     - trigger_message: the message that matched (sender, time, text)
@@ -354,14 +443,23 @@ async def kakao_get_monitor_events(wait_sec: float = 0) -> Dict:
     """
     try:
         monitor = controller._chat_monitor
-        events = await asyncio.to_thread(monitor.get_events, wait_sec) if wait_sec > 0 else monitor.get_events()
-        is_running = monitor.is_running
+        if room_name is not None:
+            events = (await asyncio.to_thread(monitor.get_events, wait_sec, room_name)
+                      if wait_sec > 0 else monitor.get_events(0, room_name))
+            status = monitor.status(room_name)
+            is_running = bool(status.get("monitoring"))
+            baseline = bool(status.get("baseline_ready"))
+        else:
+            events = await asyncio.to_thread(monitor.get_events, wait_sec) if wait_sec > 0 else monitor.get_events()
+            status = monitor.status()
+            is_running = monitor.is_running
+            baseline = is_running and monitor.baseline_ready
         return {
             "monitoring": is_running,
-            "baseline_ready": is_running and controller._chat_monitor.baseline_ready,
+            "baseline_ready": baseline,
             "event_count": len(events),
             "events": events,
-            "status": monitor.status(),
+            "status": status,
         }
     except Exception as e:
         return {"error": f"Failed to get monitor events: {e}"}

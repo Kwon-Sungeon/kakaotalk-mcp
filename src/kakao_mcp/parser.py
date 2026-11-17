@@ -42,17 +42,24 @@ HEADER_PATTERN = re.compile(
 NOTICE_PATTERN = re.compile(
     r'^(?:.+님이 (?:들어왔습니다|나갔습니다)\.'
     r'|.+님이 .+님을 초대했습니다\.'
-    r'|.+님을 내보냈습니다\.'
-    r'|채팅방 관리자가 메시지를 가렸습니다\.)$'
+    r'|(?:.+님이 )?.+님을 내보냈습니다\.'
+    r'|채팅방 관리자가 메시지를 가렸습니다\.'
+    r'|삭제된 메시지입니다\.'
+    r'|메시지가 삭제되었습니다\.'
+    r'|You invited .+'
+    r'|\S+(?:\s+\S+)* invited \S+(?:\s+\S+)*(?: to (?:the|this) chat(?:room)?)?\.?'
+    r'|(?:You|.+?) (?:joined|left)(?: (?:the|this) chat(?:room)?)?\.?'
+    r'|(?:The (?:chatroom )?admin hid (?:a|this) message|This message was deleted|Message deleted)\.?)$'
 )
 
 # URL extraction
 URL_PATTERN = re.compile(
-    r'https?://[^\s<>"\')\]]+',
+    r'https?://[^\s<>"\'\]]+',
     re.IGNORECASE,
 )
 _URL_TRAILING = '.,;:!?'
 _PHOTO_PATTERN = re.compile(r'^사진(?: \d+장)?$')
+_FILE_PATTERN = re.compile(r'^파일:\s*\S[^\r\n]*(?:\r?\n\s*(?:\([^)\n]+\)|용량\s*:[^\n]+))?$')
 
 
 def _clock_24h(meridiem: Optional[str], clock: str) -> Optional[str]:
@@ -87,11 +94,23 @@ def date_to_iso(date_text: Optional[str]) -> Optional[str]:
         return None
 
 
+def _trim_url(url: str) -> str:
+    """Strip trailing sentence punctuation and unmatched closing parentheses."""
+    while url:
+        if url[-1] in _URL_TRAILING:
+            url = url[:-1]
+        elif url[-1] == ')' and url.count(')') > url.count('('):
+            url = url[:-1]
+        else:
+            break
+    return url
+
+
 def find_urls(text: str) -> List[str]:
     """URLs in text, without the sentence punctuation that follows them."""
     urls = []
     for url in URL_PATTERN.findall(text or ''):
-        url = url.rstrip(_URL_TRAILING)
+        url = _trim_url(url)
         if url.partition('://')[2]:
             urls.append(url)
     return urls
@@ -211,7 +230,7 @@ def _finalize_message(msg: Dict, messages_list: List[Dict]):
     msg["timestamp"] = f'{day}T{clock}' if day and clock else None
     msg["is_photo"] = bool(_PHOTO_PATTERN.match(text))
     msg["is_video"] = text == "동영상"
-    msg["is_file"] = text.startswith("파일:")
+    msg["is_file"] = bool(_FILE_PATTERN.match(text))
     msg["is_emoticon"] = text == "이모티콘"
     msg["urls"] = find_urls(msg["text"])
     messages_list.append(msg)

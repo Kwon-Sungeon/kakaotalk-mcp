@@ -10,15 +10,18 @@ KAKAO_EDIT_CLASS = "RICHEDIT50W"
 
 # Win32 message constants
 WM_SETTEXT = 0x000C
+WM_CLOSE = 0x0010
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 WM_CHAR = 0x0102
 VK_RETURN = 0x0D
 VK_CONTROL = 0x11
 VK_ESCAPE = 0x1B
+VK_PRIOR = 0x21
 VK_A = 0x41
 VK_C = 0x43
 KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
 
 # KakaoTalk data paths
 KAKAO_LOCAL_DATA = os.path.join(
@@ -39,6 +42,9 @@ IMAGE_CACHE_SUBDIRS = [
 CLIPBOARD_MAX_RETRIES = 5
 CLIPBOARD_RETRY_INTERVAL_SEC = 0.1
 KEY_COMBO_WAIT_SEC = 0.15  # Was 0.3 — Ctrl+A/C combo wait
+CLIPBOARD_POLL_INTERVAL_SEC = 0.015
+WINDOW_CLOSE_WAIT_SEC = 1.0
+IMAGE_CONVERT_TIMEOUT_SEC = 15
 
 # Window and focus timing
 WINDOW_ACTIVATE_WAIT_SEC = 0.15  # Was 0.2 — after bring_window_to_front
@@ -78,6 +84,7 @@ KAKAO_INPUT_PLACEHOLDERS = frozenset(
 # Monitor
 MONITOR_MAX_EVENTS = 100
 MONITOR_MAX_WAIT_SEC = 45.0  # Upper bound for a blocking event wait (hosts time out near 60 s)
+MONITOR_MIN_POLL_INTERVAL_SEC = 3.0
 MONITOR_MATCH_ALL = "*"  # Keyword which matches every new message
 
 # Default output directory for downloaded images

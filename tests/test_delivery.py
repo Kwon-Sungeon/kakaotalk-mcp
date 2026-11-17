@@ -229,3 +229,64 @@ def test_new_bubble_requires_exact_new_content_and_an_anchored_tail():
     assert not check(old + [row('테스트', False)])
     assert not check(old + [test, test])
     assert not d._new_bubble(None, [test], 'text', '테스트', None)
+
+
+def test_new_bubble_accepts_file_name_variants(tmp_path):
+    path = str(tmp_path / 'report.pdf')
+    before = [(None, '10:34', '이전', False, False, True)]
+    for label in ('report.pdf', '파일: report.pdf', '파일:report.pdf', '파일: report.pdf (1.2MB)'):
+        after = before + [(None, '10:35', label, False, True, True)]
+        assert d._new_bubble(before, after, 'file', path, None)
+    assert not d._new_bubble(before, before + [(None, '10:35', '파일: other.pdf', False, True, True)], 'file', path, None)
+
+
+def test_qt_conversation_accepts_empty_room_only_when_at_end_true(monkeypatch):
+    room = d.Room('empty', 23, 17, True)
+    monkeypatch.setattr(qt, 'call', lambda *args, **kwargs: {'hwnd': 23, 'process_id': 17, 'messages': [], 'at_end': True})
+    assert d._conversation(room) == ([], 'uia')
+    monkeypatch.setattr(qt, 'call', lambda *args, **kwargs: {'hwnd': 23, 'process_id': 17, 'messages': [], 'at_end': None})
+    assert d._conversation(room) == (None, 'uia')
+
+
+def test_qt_text_deliver_uses_single_verify_bubble_without_redundant_roundtrips(tmp_path, monkeypatch):
+    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path))
+    monkeypatch.setattr(qt, 'available', lambda: True)
+    find_win = Mock(return_value=23)
+    monkeypatch.setattr(qt, 'find_chat_window', find_win)
+    legacy.win32process.GetWindowThreadProcessId.return_value = (5, 17)
+    read_call = Mock(side_effect=AssertionError('qt read should not run for verify_bubble text send'))
+    monkeypatch.setattr(qt, 'call', read_call)
+    worker = Mock(return_value={'sent': True, 'confirmation': 'new_room_bubble'})
+    monkeypatch.setattr(d.bridge, 'request', worker)
+
+    result = server.kakao_send_message('fixture', '안녕하세요')
+    assert result['success'] is True
+    assert result['results'][0]['confirmation'] == 'new_room_bubble'
+    find_win.assert_called_once_with('fixture')
+    read_call.assert_not_called()
+    assert worker.call_args.args[0] == {
+        'action': 'send',
+        'text': '안녕하세요',
+        'mention': None,
+        'room': 'fixture',
+        'hwnd': 23,
+        'process_id': 17,
+        'qt': True,
+        'verify_bubble': True,
+    }
+
+
+def test_legacy_complete_mode_retries_bubble_check_once(tmp_path, monkeypatch):
+    monkeypatch.setenv('LOCALAPPDATA', str(tmp_path))
+    room = d.Room('Room', 11, 22, False)
+    monkeypatch.setattr(d.Room, 'verify', lambda self: None)
+    monkeypatch.setattr(d.legacy, 'find_chat_input', lambda _: 33)
+    monkeypatch.setattr(d, '_submit', lambda *args, **kwargs: {'sent': True, 'confirmation': 'draft_cleared'})
+    monkeypatch.setattr(d.time, 'sleep', lambda _: None)
+    before = [('Other', '10:00', 'hi', False, False, False)]
+    after_late = before + [('Me', '10:01', 'Test', False, False, True)]
+    monkeypatch.setattr(d, '_conversation', Mock(side_effect=[
+        (None, 'complete'), (before, 'complete'), (before, 'complete'), (before, 'complete'), (after_late, 'complete')
+    ]))
+    res = d.dispatch(room, 'text', 'Test', None)
+    assert res == {'sent': True, 'confirmation': 'new_room_bubble'}

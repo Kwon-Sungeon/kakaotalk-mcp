@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import sqlite3
 import struct
 import time
@@ -63,6 +64,7 @@ def resolve(name, ref=None):
         raise DeliveryError('invalid_argument', 'An exact room name is required')
     impl = qt if qt.available() else legacy
     hwnd = impl.find_chat_window(name)
+    opened_fresh = False
     if not hwnd:
         if ref:
             raise DeliveryError('room_changed', 'The referenced room is no longer open')
@@ -70,10 +72,12 @@ def resolve(name, ref=None):
         if not opened['success']:
             raise DeliveryError(opened.get('code', 'room_not_verified'), opened['error'])
         hwnd = opened['hwnd']
+        opened_fresh = True
     room = Room(name, hwnd, legacy.win32process.GetWindowThreadProcessId(hwnd)[1], impl is qt)
     if ref is not None and ref != room.ref:
         raise DeliveryError('room_changed', 'Room reference no longer matches the exact window')
-    room.verify()
+    if opened_fresh:
+        room.verify()
     return room
 
 
@@ -81,23 +85,20 @@ def resolve(name, ref=None):
 def file_clipboard(path):
     clip = legacy.win32clipboard
     snapshot = legacy._plain_clipboard_snapshot()
-    clip.OpenClipboard()
-    try:
+    with legacy._open_clipboard(clip):
         before = clip.GetClipboardSequenceNumber()
         clip.EmptyClipboard()
         # DROPFILES with a double-NUL-terminated UTF-16 file list.
         clip.SetClipboardData(win32con.CF_HDROP, struct.pack('<IiiII', 20, 0, 0, 0, 1)
                               + (path + '\0\0').encode('utf-16-le'))
         after = clip.GetClipboardSequenceNumber()
-    finally:
-        clip.CloseClipboard()
     try:
         yield after
     finally:
         legacy._restore_plain_clipboard(snapshot, before, after)
 
 
-def _submit(room, kind, value, mention, *, replace_legacy_hint=False):
+def _submit(room, kind, value, mention, *, replace_legacy_hint=False, verify_bubble=False):
     args = room.arguments()
     if kind in ('file', 'file_clipboard', 'file_picker'):
         if kind == 'file_picker' and room.is_qt:
@@ -107,11 +108,14 @@ def _submit(room, kind, value, mention, *, replace_legacy_hint=False):
         if room.is_qt or kind == 'file_clipboard':
             if not room.is_qt:
                 edit = legacy.find_chat_input(room.hwnd)
-                if not edit or not legacy._empty_input(edit):
+                shown = legacy._edit_text(edit) if edit else ''
+                if not edit or legacy._is_real_draft(edit, shown):
                     error = DeliveryError('input_not_ready', 'Empty legacy chat input required')
                     error.before_send = True
                     raise error
                 args['edit_hwnd'] = edit
+                if shown in legacy.config.KAKAO_INPUT_PLACEHOLDERS and not legacy._empty_input(edit, shown):
+                    args['literal_hint'] = shown
             with file_clipboard(value) as sequence:
                 return bridge.request(dict(action='file', path=value, sequence=sequence, **args), 18)
         return bridge.request(dict(action='file', path=value, **args), 22)
@@ -120,7 +124,10 @@ def _submit(room, kind, value, mention, *, replace_legacy_hint=False):
             with legacy.temporary_image_clipboard(value) as sequence:
                 return bridge.request(dict(action='image', sequence=sequence, **args), 15)
         action = 'mention' if kind == 'mention' else 'send'
-        return bridge.request(dict(action=action, text=value, mention=mention, **args), 15)
+        payload = dict(action=action, text=value, mention=mention, **args)
+        if action == 'send' and verify_bubble:
+            payload['verify_bubble'] = True
+        return bridge.request(payload, 15)
     if kind == 'image':
         return legacy.send_image_to_room(room.name, value, target=room)
     if kind == 'mention':
@@ -136,8 +143,9 @@ def _conversation(room, mode=None):
         if data.get('hwnd') != room.hwnd or data.get('process_id') != room.pid or data.get('at_end') is False:
             return None, 'uia'
         rows = data['messages']
-        # Empty UIA arrays also occur when the transcript is not exposed.
-        if not rows:
+        # Empty UIA arrays also occur when the transcript is not exposed;
+        # only accept empty lists when at_end is explicitly confirmed True.
+        if not rows and data.get('at_end') is not True:
             return None, 'uia'
         mode = 'uia'
     else:
@@ -183,40 +191,61 @@ def _new_bubble(before, after, kind, value, mention):
         return photo
     if kind == 'file':
         name = Path(value).name
-        return file and body in (name, '파일: ' + name)
+        return file and (body == name or bool(re.match(rf'^파일:\s*{re.escape(name)}(?:\s+\([^)]+\))?$', body)))
     return not photo and not file and body == expected
 
 
 def dispatch(room, kind, value, mention, *, replace_legacy_hint=False):
     chat_kind = 'file' if kind.startswith('file_') else kind
+    if room.is_qt and kind == 'text':
+        outcome = _submit(room, kind, value, mention, replace_legacy_hint=replace_legacy_hint, verify_bubble=True)
+        if not (outcome.get('success') or outcome.get('sent')):
+            return outcome
+        if outcome.get('confirmation') == 'new_room_bubble':
+            return {'sent': True, 'confirmation': 'new_room_bubble'}
+        return {'success': False, 'status': 'unconfirmed', 'code': 'send_unconfirmed',
+                'error': 'New matching bubble not verified in the pinned room. Inspect the room before retrying.'}
+
     before, mode = None, None
-    try:
-        before, mode = _conversation(room)
-    except Exception:
-        pass  # Still submit once; missing evidence can only produce an unconfirmed receipt.
+    baseline_failed = False
+    for attempt in range(2 if not room.is_qt else 1):
+        try:
+            before, mode = _conversation(room)
+            if before is not None:
+                break
+            baseline_failed = True
+        except Exception:
+            baseline_failed = True  # Still submit once; missing evidence can only produce an unconfirmed receipt.
+        if attempt == 0 and not room.is_qt:
+            time.sleep(.1)
     # A failed baseline read may have involved a window change. Re-pin before writing.
-    try:
-        room.verify()
-        if not room.is_qt:
-            legacy.find_chat_input(room.hwnd)
-    except Exception as error:
-        error.before_send = True
-        raise
+    if baseline_failed or not room.is_qt:
+        try:
+            room.verify()
+            if not room.is_qt:
+                legacy.find_chat_input(room.hwnd)
+        except Exception as error:
+            error.before_send = True
+            raise
     outcome = _submit(room, kind, value, mention, replace_legacy_hint=replace_legacy_hint)
     if not (outcome.get('success') or outcome.get('sent')):
         return outcome
     if before is not None:
-        deadline = time.monotonic() + 2.0
+        deadline = time.monotonic() + (3.0 if mode == 'complete' else 2.0)
+        attempts = 0
         while True:
+            attempts += 1
             try:
                 after, _ = _conversation(room, mode)
+            except DeliveryError:
+                raise
             except Exception:
-                break
+                after = None
             if _new_bubble(before, after, chat_kind, value, mention):
                 return {'sent': True, 'confirmation': 'new_room_bubble'}
-            if time.monotonic() >= deadline or mode == 'complete':
+            if time.monotonic() >= deadline or (mode == 'complete' and attempts >= 4):
                 break
-            time.sleep(.12)
+            time.sleep(.35 if mode == 'complete' else .12)
     return {'success': False, 'status': 'unconfirmed', 'code': 'send_unconfirmed',
             'error': 'New matching bubble not verified in the pinned room. Inspect the room before retrying.'}
 
@@ -273,7 +302,7 @@ def send_policy():
 
 
 def deliver(kind, entries, *, mention=None, refs=None, request_id=None, interval=0, dry_run=False,
-            file_method='auto', replace_legacy_hint=False):
+            file_method='auto', replace_legacy_hint=True):
     """Commit uncertainty before dispatch so termination cannot turn into a replay."""
     if kind in {'image', 'file'}:
         entries = [(room, os.fspath(value)) for room, value in entries]

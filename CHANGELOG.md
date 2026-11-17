@@ -5,7 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.0] - 2026-11-17
+
+- **구형 입력란 안내 문구(`메시지 입력`) 즉시 교체 및 Windows 11 클립보드 안정화**: 구형 `RICHEDIT50W`에서 안내 문구(`메시지 입력`)가 문자열로 반환될 때 텍스트·이미지·파일·멘션 전송 전반에서 실제 사용자 초안과 구분해 중단 없이 처리하며(`_is_real_draft`, `replace_legacy_hint=True` 기본값), Windows 11 `CloseClipboard()` 합성 시 `HGLOBAL` 핸들 재할당 오탐 수정, `OpenClipboard` 일시적 접근 거부(`WinError 5`) 재시도(`_open_clipboard`), `GetClipboardOwner` null 예외 가드, 포커스 검증 하의 하드웨어 Enter 제출을 반영했습니다.
+- **구형 Win32 OCR 검색·목록 및 오너드로우 파일·사진 팝업 자동 전송**: 구형 `SearchListCtrl`·`ChatRoomListCtrl`(`EVA_VH_ListControl_Dblclk`)과 버튼 컨트롤이 노출되지 않는 파일·사진 전송 확인 팝업에서 다중 모니터 DPI 배율 차이를 픽셀 단위로 자동 보정하는 `CaptureRendered` 및 Windows 한글 OCR(`ConfirmLegacyAttachmentPopup`, `Ctrl+V` 이미지 붙여넣기 폴백 포함)을 통해 닫힌 방 검색 열기, `kakao_list_chats`, 무터치 파일·이미지 전송까지 일관되게 처리합니다.
+- **Qt UIA 성능 및 정확도 개선**: `qt_uia.ps1`에서 `KakaoUia` C# 헬퍼(`PropertyCondition`/`CacheRequest`), `InitializeOcr`/`InitializeForms` 1회 초기화, `send`의 `verify_bubble` 인워커 검증 및 폴링 대기(최대 400ms 버튼 대기 / 40ms 클리어·말풍선 확인)로 중복 왕복과 고정 대기 시간을 단축했습니다.
+- **다국어·24시간제 및 파싱 보강**: Qt `Messages`의 영어(`AM/PM`)·24시간제·영문 날짜 구분선·파일명 null 안전성을 보완하고, `parser.py`에서 `파일:` 공백/용량 변형·균형 괄호 URL·추가 시스템 알림을 지원합니다.
+- **구형 Win32 안정성·성능 개선**: `EnumWindows`/`EnumChildWindows` 콜백 예외 가드 추가, `@멘션` 비한글(영문·숫자·기호) `SendInput(KEYEVENTF_UNICODE)` 지원, 인프로세스 WIC 이미지 디코딩 및 `.webp` 폴백(`Windows.Graphics.Imaging`), 클립보드 복사 폴링을 개선했습니다.
+- **전송 검증 및 모니터링 개선**: `delivery.py`의 중복 `resolve`/`verify` 및 Qt 텍스트 왕복을 제거하고, 구형 `complete` 모드 기준선 재시도 및 말풍선 확인 대기 여유(최대 4회 / 3.0초)와 스크롤 위치 자동 정렬·빈 방 확인(`at_end=True`)을 보강했습니다. `ChatMonitor` 날짜 구분선 이탈 오탐을 수정하고 `MonitorManager`로 다중 방 동시 모니터링을 지원합니다.
+- **신규 도구 및 스크롤 페이지네이션**: `kakao_read_messages(..., scroll_pages=N)` 이전 대화 스크롤 읽기, `kakao_list_chats`, `kakao_list_participants`, `kakao_close_room`, `kakao_inspect_ui`(`owned_popups` 모달 트리 진단 포함)를 추가하고 `.ps1` 파일에 UTF-8 BOM을 적용했습니다.
 
 ## [0.7.0] - 2026-11-13
 

@@ -271,8 +271,8 @@ def test_blank_keywords_are_rejected():
     ('sequence_at_close', None), ('focus_clears_hint', None), ('literal_draft', 'input_hint_unresolved'),
     ('verified_hint', None), ('hint_is_payload', 'input_hint_unresolved'),
     ('different_draft', 'draft_changed'), ('room_change', 'room_changed'),
-    ('same_text_new_clip', 'clipboard_changed'), ('clipboard_race', 'clipboard_changed'),
-    ('paste_not_applied', 'paste_text_mismatch'),
+    ('same_text_reallocated_handle', None), ('replaced_clip_text', 'clipboard_changed'),
+    ('clipboard_race', 'clipboard_changed'), ('paste_not_applied', 'paste_text_mismatch'),
 ])
 def test_buttonless_paste_and_exact_submission(monkeypatch, scenario, code):
     import win32con
@@ -282,7 +282,9 @@ def test_buttonless_paste_and_exact_submission(monkeypatch, scenario, code):
     state = {'draft': cue, 'clip': 'previous', 'seq': 10, 'writing': False, 'open': False, 'handle': 1}
     for name in ('bring_window_to_front', '_focus_control', '_require_focus'):
         monkeypatch.setattr(controller, name, Mock())
+    clicks = []
     def click(*args):
+        clicks.append(args)
         if scenario == 'focus_clears_hint':
             state['draft'] = ''
     monkeypatch.setattr(controller, '_click_control', click)
@@ -314,8 +316,10 @@ def test_buttonless_paste_and_exact_submission(monkeypatch, scenario, code):
         if state['writing']:
             state['seq'] = 12  # Win32 publishes synthesized formats on close.
             state['writing'] = False
-            if scenario == 'same_text_new_clip':
+            if scenario == 'same_text_reallocated_handle':
                 state['handle'] += 1
+            if scenario == 'replaced_clip_text':
+                state['clip'] = 'other'
             if scenario == 'different_draft':
                 state['draft'] = 'new private draft'
         elif scenario == 'clipboard_race':
@@ -333,25 +337,27 @@ def test_buttonless_paste_and_exact_submission(monkeypatch, scenario, code):
         assert key == 0x56 and not state['open'] and (not literal or state['draft'] == '' or state.get('selected'))
         if scenario != 'paste_not_applied':
             state['draft'] = state['clip'].replace('\r\n', '\n')
-    def submit(edit, msg, key, flags):
-        assert edit == 22 and key == win32con.VK_RETURN and state['draft'] == expected
-        if msg == win32con.WM_KEYUP:
-            state['draft'] = cue
+    def submit(vk, shift=False):
+        assert vk == win32con.VK_RETURN and not shift and state['draft'] == expected
+        state['draft'] = cue
     key = Mock(side_effect=paste)
+    enter = Mock(side_effect=submit)
     monkeypatch.setattr(controller, '_send_ctrl_key_combo', key)
-    controller.win32gui.PostMessage.side_effect = submit
+    monkeypatch.setattr(controller, '_press_key', enter)
     result = controller.send_message_to_room('fixture', expected,
                     replace_legacy_hint=scenario in {'verified_hint', 'different_draft', 'hint_is_payload'})
     if code:
         assert result['status'] == 'failed_before_send' and result['code'] == code
-        controller.win32gui.PostMessage.assert_not_called()
+        enter.assert_not_called()
         if scenario != 'paste_not_applied':
             key.assert_not_called()
     else:
         assert result['confirmation'] == 'draft_cleared'
         key.assert_called_once_with(0x56)
-        assert controller.win32gui.PostMessage.call_count == 2
+        enter.assert_called_once_with(win32con.VK_RETURN)
         restore.assert_called_once_with((10, 'previous'), 10, 12)
+        if scenario == 'verified_hint':
+            assert clicks == []
 
 
 def test_multiple_account_caches_require_selection(monkeypatch, tmp_path):
@@ -394,3 +400,92 @@ def test_placeholder_itself_is_only_a_sendable_draft_when_it_has_characters(monk
     controller.win32gui.SendMessageTimeout.side_effect = [(1, 0), (1, len(cue))]
     assert not controller._matches_draft(11, cue)
     assert controller._matches_draft(11, cue)
+
+
+def test_monitor_survives_date_separator_scroll_off_without_duplicates(monkeypatch):
+    monitor = controller.ChatMonitor()
+    m1_dated = {'date': '2026년 11월 12일 목요일', 'sender': 'A', 'time': '오전 10:00', 'text': '안녕'}
+    m2_dated = {'date': '2026년 11월 12일 목요일', 'sender': 'B', 'time': '오전 10:01', 'text': '반가워'}
+    m1_lost = {'date': None, 'sender': 'A', 'time': '오전 10:00', 'text': '안녕'}
+    m2_lost = {'date': None, 'sender': 'B', 'time': '오전 10:01', 'text': '반가워'}
+    m3_new = {'date': None, 'sender': 'A', 'time': '오전 10:02', 'text': '새 메시지'}
+
+    read = Mock(side_effect=[
+        {'success': True, 'parsed': {'messages': [m1_dated, m2_dated]}},
+        # Date header scrolled off top -> date becomes None on both messages
+        {'success': True, 'parsed': {'messages': [m1_lost, m2_lost]}},
+        # Top message scrolled off + 1 new message arrives without date header
+        {'success': True, 'parsed': {'messages': [m2_lost, m3_new]}},
+        # User scrolled back up -> dates return on old messages
+        {'success': True, 'parsed': {'messages': [m1_dated, m2_dated]}},
+    ])
+    monkeypatch.setattr(backend, 'read_chat_messages', read)
+    monitor._keywords = ['*']
+    monitor._load_initial_messages()
+
+    monitor._check_for_new_messages()
+    assert monitor.get_events() == []
+
+    monitor._check_for_new_messages()
+    events = monitor.get_events()
+    assert [e['trigger_message'] for e in events] == [m3_new]
+
+    # Counter fallback when scrolled up to [m1_dated, m2_dated] (k=0 overlap with [m2_lost, m3_new])
+    monitor._check_for_new_messages()
+    assert monitor.get_events() == []
+
+
+def test_monitor_manager_multi_room_concurrent_and_selective_stop(monkeypatch):
+    manager = controller.MonitorManager()
+
+    # Keep background threads quiet while we control polls/events deterministically
+    monkeypatch.setattr(backend, 'read_chat_messages', lambda room, *a, **kw: {
+        'success': True,
+        'parsed': {'messages': [{'date': 'day', 'sender': 'A', 'time': '10:00', 'text': f'{room} base'}]},
+    })
+
+    res_a = manager.start('RoomA', ['urgent'], poll_interval=60.0)
+    res_b = manager.start('RoomB', ['*'], poll_interval=60.0)
+    try:
+        assert res_a['success'] is True
+        assert res_b['success'] is True
+        assert manager.is_running is True
+        assert manager.baseline_ready is True
+
+        # Starting RoomA again must fail, while RoomC could still start
+        dup = manager.start('RoomA', ['other'], poll_interval=60.0)
+        assert dup['success'] is False and 'already running' in dup['error'].lower()
+
+        st = manager.status()
+        assert st['monitoring'] is True
+        assert set(st['active_rooms']) == {'RoomA', 'RoomB'}
+        assert st['rooms']['RoomA']['keywords'] == ['urgent']
+
+        # Emit events to each room and verify room-filtered + global get_events
+        ev_a = {'room_name': 'RoomA', 'keyword': 'urgent', 'trigger_message': {'text': 'urgent A'}}
+        ev_b = {'room_name': 'RoomB', 'keyword': '*', 'trigger_message': {'text': 'hello B'}}
+        manager._monitors['RoomA']._emit(ev_a)
+        manager._monitors['RoomB']._emit(ev_b)
+
+        assert manager.get_events(room_name='RoomA') == [ev_a]
+        assert manager.get_events(room_name='RoomA') == []
+        # RoomB's event was preserved and waiting wakeup works
+        assert manager.get_events() == [ev_b]
+
+        threading.Timer(0.15, manager._monitors['RoomB']._emit, [ev_b]).start()
+        assert manager.get_events(wait_sec=2.0) == [ev_b]
+
+        # Selective stop keeps RoomB alive
+        stop_a = manager.stop('RoomA')
+        assert stop_a['success'] is True
+        assert manager.is_running is True
+        assert manager.status('RoomA')['monitoring'] is False
+        assert manager.status('RoomB')['monitoring'] is True
+
+        # Stop all remaining monitors
+        stop_all = manager.stop()
+        assert stop_all['success'] is True
+        assert manager.is_running is False
+    finally:
+        manager.stop()
+

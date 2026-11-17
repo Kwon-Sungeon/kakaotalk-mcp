@@ -132,3 +132,53 @@ def test_bare_date_not_appended_to_message():
     assert len(result["messages"]) == 2
     assert result["messages"][0]["text"] == "안녕"
     assert result["messages"][1]["text"] == "좋은 아침"
+
+
+def test_file_detection_variants():
+    text = (
+        "[Room] [대화상대 2명]\n"
+        "[A] [오전 9:00] 파일:report.xlsx\n"
+        "[A] [오전 9:01] 파일: quarterly summary.pdf\n"
+        "[A] [오전 9:02] 파일: budget (final).xlsx (1.2MB)\n"
+        "[A] [오전 9:03] 파일: \n"
+    )
+    msgs = parse_chat_text(text)["messages"]
+    assert [m["is_file"] for m in msgs] == [True, True, True, False]
+
+
+def test_korean_and_english_notices_not_glued():
+    text = (
+        "Thursday, February 27, 2025\n"
+        "[Alice] [10:00 AM] hello\n"
+        "You invited Bob.\n"
+        "Alice joined the chatroom.\n"
+        "Carol left.\n"
+        "[Bob] [10:01 AM] hi\n"
+        "삭제된 메시지입니다.\n"
+        "채팅방 관리자가 메시지를 가렸습니다.\n"
+    )
+    result = parse_chat_text(text)
+    assert [m["text"] for m in result["messages"]] == ["hello", "hi"]
+    assert [n["text"] for n in result["notices"]] == [
+        "You invited Bob.",
+        "Alice joined the chatroom.",
+        "Carol left.",
+        "삭제된 메시지입니다.",
+        "채팅방 관리자가 메시지를 가렸습니다.",
+    ]
+
+
+def test_urls_preserve_balanced_parentheses():
+    from kakao_mcp.parser import find_urls
+
+    assert find_urls("참고 https://en.wikipedia.org/wiki/Foo_(bar).") == [
+        "https://en.wikipedia.org/wiki/Foo_(bar)"
+    ]
+    assert find_urls("(see https://en.wikipedia.org/wiki/Foo_(bar))") == [
+        "https://en.wikipedia.org/wiki/Foo_(bar)"
+    ]
+    assert find_urls("https://example.com/a_(1)_(2), 확인") == [
+        "https://example.com/a_(1)_(2)"
+    ]
+    assert find_urls("(https://example.com/c)") == ["https://example.com/c"]
+
